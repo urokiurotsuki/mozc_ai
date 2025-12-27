@@ -67,6 +67,9 @@
 #include "request/conversion_request.h"
 #include "rewriter/rewriter_interface.h"
 #include "transliteration/transliteration.h"
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace mozc {
 namespace converter {
@@ -75,39 +78,33 @@ namespace {
 // ==========================================
 // [追記開始] AI Server (Named Pipe) Client
 // ==========================================
-#ifdef _WIN32
-#include <windows.h>
-#endif
 
 // PythonのNamed Pipeサーバーに接続して変換候補をもらう関数
 std::string QueryAiConversion(const std::string& input_text) {
 #ifdef _WIN32
-    // 1. パイプに接続
-    HANDLE hPipe = CreateFileA(
-        "\\\\.\\pipe\\MozcBertPipe", // パイプ名
+    // Windows APIを呼ぶときはグローバルスコープ演算子(::)をつけるのが安全
+    HANDLE hPipe = ::CreateFileA(
+        "\\\\.\\pipe\\MozcBertPipe",
         GENERIC_READ | GENERIC_WRITE,
         0, NULL, OPEN_EXISTING, 0, NULL
     );
 
     if (hPipe == INVALID_HANDLE_VALUE) {
-        return ""; // サーバーがいなければ何もしない
+        return "";
     }
 
-    // 2. 送信 (入力テキスト)
     DWORD dwWritten;
-    WriteFile(hPipe, input_text.c_str(), input_text.size(), &dwWritten, NULL);
+    ::WriteFile(hPipe, input_text.c_str(), input_text.size(), &dwWritten, NULL);
 
-    // 3. 受信 (AIからの変換結果)
     char buffer[4096];
     DWORD dwRead;
-    // ブロッキングで待機（※実用時はタイムアウト設定推奨）
-    if (ReadFile(hPipe, buffer, sizeof(buffer) - 1, &dwRead, NULL)) {
+    if (::ReadFile(hPipe, buffer, sizeof(buffer) - 1, &dwRead, NULL)) {
         buffer[dwRead] = '\0';
-        CloseHandle(hPipe);
+        ::CloseHandle(hPipe);
         return std::string(buffer);
     }
 
-    CloseHandle(hPipe);
+    ::CloseHandle(hPipe);
 #endif
     return "";
 }
@@ -550,42 +547,37 @@ bool Converter::ResizeSegments(Segments* segments,
 void Converter::ApplyConversion(Segments* segments,
                                 const ConversionRequest& request) const {
   if (!immutable_converter_->Convert(request, segments)) {
-    // Conversion can fail for keys like "12". Even in such cases, rewriters
-    // (e.g., number and variant rewriters) can populate some candidates.
-    // Therefore, this is not an error.
     MOZC_VLOG(1) << "Convert failed for key: " << segments->segment(0).key();
   }
 
-  // ▼▼▼▼▼▼▼ [ここから追加] AI割り込み処理 ▼▼▼▼▼▼▼
-  // 入力が「変換(CONVERSION)」の時だけ発動（予測変換中などは重くなるので除外した方が無難）
+  // ▼▼▼ [修正] AI呼び出し処理 ▼▼▼
   if (request.request_type() == ConversionRequest::CONVERSION &&
       segments->conversion_segments_size() > 0) {
       
     Segment *seg = segments->mutable_conversion_segment(0);
-    std::string key = seg->key(); // 読み（ひらがな）を取得
+    
+    // 【修正】absl::string_view から std::string への正しい変換
+    std::string key(seg->key().data(), seg->key().size());
 
-    // さっき作った関数でAIに問い合わせ
-    // ※const関数内から呼ぶため、QueryAiConversion側も本来はconst対応が必要ですが、
-    // ここでは簡易的に動かすためにそのまま呼びます。
     std::string ai_result = QueryAiConversion(key);
 
     if (!ai_result.empty()) {
-       // 候補リストの末尾にとりあえず追加
        Candidate *cand = seg->push_back_candidate();
        
-       // 候補の中身を設定
-       cand->Init();
-       cand->key = key;               // 読み
-       cand->content_key = key;       
-       cand->value = ai_result;       // 表記（AIが決めた漢字）
+       // 【修正】Init()は使わず、直接代入する
+       cand->key = key;
+       cand->content_key = key;
+       cand->value = ai_result;
        cand->content_value = ai_result;
-       cand->cost = 0;                // コスト0（最優先扱い）
+       cand->cost = 0;
        cand->structure_cost = 0;
        
-       // 【重要】追加したAI候補を、リストの「一番上（0番目）」に強制移動
-       // これでスペースキー一発目でAIの候補が出ます
+       // その他の属性も念のため初期化
+       cand->lid = 0; 
+       cand->rid = 0;
+
+       // 0番目に移動
        if (seg->candidates_size() > 1) {
-         // 末尾(size-1)にある要素を、0番目の位置へ移動
          seg->move_candidate(seg->candidates_size() - 1, 0);
        }
     }
