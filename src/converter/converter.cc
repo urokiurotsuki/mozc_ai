@@ -79,11 +79,6 @@ namespace {
 #include <windows.h>
 #endif
 
-// 既存のincludeと重複していてもガードされるので大丈夫ですが、
-// 気になるなら重複分（<string>, <vector>等）は消してください
-
-// ★namespace mozc { namespace {  <-- これを書かないのがポイント！
-
 // PythonのNamed Pipeサーバーに接続して変換候補をもらう関数
 std::string QueryAiConversion(const std::string& input_text) {
 #ifdef _WIN32
