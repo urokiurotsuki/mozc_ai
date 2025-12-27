@@ -40,8 +40,8 @@
 #include <tuple>
 #include <utility>
 #include <vector>
-#include <fstream>   // ログ出力用
-#include <sstream>
+#include <windows.h>
+#include <stdio.h> // sprintf用
 
 #include "absl/base/optimization.h"
 #include "absl/log/check.h"
@@ -70,7 +70,6 @@
 #include "rewriter/rewriter_interface.h"
 #include "transliteration/transliteration.h"
 #ifdef _WIN32
-#include <windows.h>
 #endif
 
 namespace mozc {
@@ -82,55 +81,57 @@ namespace {
 // ==========================================
 
 // PythonのNamed Pipeサーバーに接続して変換候補をもらう関数
+void DebugLog(const char* format, ...) {
+    char buffer[1024];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    // DebugView等のデバッガに文字列を送る
+    ::OutputDebugStringA(buffer);
+}
+// ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+
+// Pythonサーバーに接続する関数 (DebugView版)
 std::string QueryAiConversion(const std::string& history_context, const std::string& kana) {
-#ifdef _WIN32
+    // _WIN32が定義されているかチェック (ビルド時にエラーにする)
+    #ifndef _WIN32
+    #error "_WIN32 is not defined! Windows APIs will fail."
+    #endif
+
     static const char* kPipeName = "\\\\.\\pipe\\MozcBertPipe";
-    
-    // ログファイル (C:\Users\Public\mozc_debug.txt) に追記モードで出力
-    // ※これで接続状況が可視化されます
-    std::ofstream log("C:\\Users\\Public\\mozc_debug.txt", std::ios::app);
-    
     std::string payload = history_context + "\t" + kana;
     char buffer[4096];
     DWORD bytesRead = 0;
 
-    log << "[Try] Connecting... Input: " << kana << std::endl;
+    // ログ: 接続開始
+    DebugLog("[MozcAI] Connecting... Input: %s (CtxLen: %d)\n", kana.c_str(), history_context.size());
 
-    // ★修正点: CallNamedPipeAを使用
-    // 相手が見つかるまで最大2000ミリ秒(2秒)待機し、接続・送信・受信を一括で行う
+    // 接続・送信・受信 (2秒タイムアウト)
     BOOL success = ::CallNamedPipeA(
-        kPipeName,                  // パイプ名
-        (LPVOID)payload.c_str(),    // 送信データ
-        payload.size(),             // 送信サイズ
-        buffer,                     // 受信バッファ
-        sizeof(buffer),             // 受信バッファサイズ
-        &bytesRead,                 // 受信したバイト数
-        2000                        // ★タイムアウト(2秒待つ)
+        kPipeName,
+        (LPVOID)payload.c_str(),
+        payload.size(),
+        buffer,
+        sizeof(buffer),
+        &bytesRead,
+        2000
     );
 
     if (success) {
         std::string result(buffer, bytesRead);
-        log << "[Success] AI Response: " << result << std::endl;
+        DebugLog("[MozcAI] Success! Response: %s\n", result.c_str());
         return result;
     } else {
         DWORD err = ::GetLastError();
-        log << "[Failed] Error Code: " << err;
-        
-        // よくあるエラーの原因をログに明記
-        if (err == 2) log << " (Server Not Found - Python未起動)";
-        if (err == 5) log << " (Access Denied - 権限不足)";
-        if (err == 121) log << " (Timeout - 応答なし)";
-        
-        log << std::endl;
+        DebugLog("[MozcAI] Failed. ErrorCode: %d\n", err);
         return "";
     }
-#endif
-    return "";
 }
-// ▼▼▼ 追加: Mozcの履歴から文脈を抽出する関数 ▼▼▼
+
+// 履歴取得関数
 std::string GetHistoryContext(const Segments& segments) {
     std::string history = "";
-    // 履歴セグメント（確定済みの文字列）を走査して結合
     for (size_t i = 0; i < segments.history_segments_size(); ++i) {
         const Segment& seg = segments.history_segment(i);
         if (seg.candidates_size() > 0) {
@@ -577,6 +578,10 @@ bool Converter::ResizeSegments(Segments* segments,
 
 void Converter::ApplyConversion(Segments* segments,
                                 const ConversionRequest& request) const {
+  // ▼▼▼ 追加: 呼び出し確認ログ ▼▼▼
+  // request_typeの値をログに出す (1=CONVERSION)
+  DebugLog("[MozcAI] ApplyConversion called. Type: %d\n", request.request_type());
+
   // 1. まずMozc標準エンジンで全候補を出す
   if (!immutable_converter_->Convert(request, segments)) {
     MOZC_VLOG(1) << "Convert failed for key: " << segments->segment(0).key();
