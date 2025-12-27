@@ -1,0 +1,40 @@
+name: Windows Build
+
+on:
+  push:
+    branches: [ master ]
+  workflow_dispatch: # 手動実行用ボタン
+
+jobs:
+  build:
+    runs-on: windows-2019 # 古めの環境のほうが安定することが多い
+
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        submodules: recursive
+
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+
+    - name: Install Dependencies
+      run: |
+        pip install six requests
+        choco install bazelisk -y
+        # Visual Studioなどの環境変数はGitHub Actions標準で入っています
+
+    - name: Build Mozc (Server & Renderer & Tool)
+      run: |
+        # エラー回避のための環境変数設定
+        $env:BAZEL_VC = "C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC"
+        
+        # ビルド実行 (時間がかかります)
+        bazelisk build --config=oss_windows //src/win32/installer:mozc_installer
+
+    - name: Upload Installer
+      uses: actions/upload-artifact@v3
+      with:
+        name: MyAiMozc_Installer
+        path: bazel-bin/src/win32/installer/*.msi
