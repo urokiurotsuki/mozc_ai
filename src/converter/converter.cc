@@ -560,17 +560,6 @@ bool Converter::ResizeSegments(Segments* segments,
   return true;
 }
 
-std::string GetHistoryContext(const Segments& segments) {
-  std::string history = "";
-  for (size_t i = 0; i < segments.history_segments_size(); ++i) {
-    const Segment& seg = segments.history_segment(i);
-    if (seg.candidates_size() > 0) {
-      history += seg.candidate(0).value;
-    }
-  }
-  return history;
-}
-
 void Converter::ApplyConversion(Segments* segments,
                                 const ConversionRequest& request) const {
   // 1. まずMozc標準エンジンで全候補を出す
