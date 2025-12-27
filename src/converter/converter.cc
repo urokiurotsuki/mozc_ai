@@ -40,6 +40,8 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+#include <fstream>   // ログ出力用
+#include <sstream>
 
 #include "absl/base/optimization.h"
 #include "absl/log/check.h"
@@ -82,36 +84,49 @@ namespace {
 // PythonのNamed Pipeサーバーに接続して変換候補をもらう関数
 std::string QueryAiConversion(const std::string& history_context, const std::string& kana) {
 #ifdef _WIN32
-    HANDLE hPipe = ::CreateFileA(
-        "\\\\.\\pipe\\MozcBertPipe",
-        GENERIC_READ | GENERIC_WRITE,
-        0, NULL, OPEN_EXISTING, 0, NULL
+    static const char* kPipeName = "\\\\.\\pipe\\MozcBertPipe";
+    
+    // ログファイル (C:\Users\Public\mozc_debug.txt) に追記モードで出力
+    // ※これで接続状況が可視化されます
+    std::ofstream log("C:\\Users\\Public\\mozc_debug.txt", std::ios::app);
+    
+    std::string payload = history_context + "\t" + kana;
+    char buffer[4096];
+    DWORD bytesRead = 0;
+
+    log << "[Try] Connecting... Input: " << kana << std::endl;
+
+    // ★修正点: CallNamedPipeAを使用
+    // 相手が見つかるまで最大2000ミリ秒(2秒)待機し、接続・送信・受信を一括で行う
+    BOOL success = ::CallNamedPipeA(
+        kPipeName,                  // パイプ名
+        (LPVOID)payload.c_str(),    // 送信データ
+        payload.size(),             // 送信サイズ
+        buffer,                     // 受信バッファ
+        sizeof(buffer),             // 受信バッファサイズ
+        &bytesRead,                 // 受信したバイト数
+        2000                        // ★タイムアウト(2秒待つ)
     );
 
-    if (hPipe == INVALID_HANDLE_VALUE) {
+    if (success) {
+        std::string result(buffer, bytesRead);
+        log << "[Success] AI Response: " << result << std::endl;
+        return result;
+    } else {
+        DWORD err = ::GetLastError();
+        log << "[Failed] Error Code: " << err;
+        
+        // よくあるエラーの原因をログに明記
+        if (err == 2) log << " (Server Not Found - Python未起動)";
+        if (err == 5) log << " (Access Denied - 権限不足)";
+        if (err == 121) log << " (Timeout - 応答なし)";
+        
+        log << std::endl;
         return "";
     }
-
-    // フォーマット: "文脈(TAB)読み"
-    // 例: "昨日のイベントでの\tきしゃ"
-    std::string payload = history_context + "\t" + kana;
-
-    DWORD dwWritten;
-    ::WriteFile(hPipe, payload.c_str(), payload.size(), &dwWritten, NULL);
-
-    char buffer[4096];
-    DWORD dwRead;
-    if (::ReadFile(hPipe, buffer, sizeof(buffer) - 1, &dwRead, NULL)) {
-        buffer[dwRead] = '\0';
-        ::CloseHandle(hPipe);
-        return std::string(buffer);
-    }
-
-    ::CloseHandle(hPipe);
 #endif
     return "";
 }
-
 // ▼▼▼ 追加: Mozcの履歴から文脈を抽出する関数 ▼▼▼
 std::string GetHistoryContext(const Segments& segments) {
     std::string history = "";
