@@ -93,19 +93,23 @@ void DebugLog(const char* format, ...) {
 // ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
 // Pythonサーバーに接続する関数 (DebugView版)
-std::string QueryAiConversion(const std::string& history_context, const std::string& kana) {
-    // _WIN32が定義されているかチェック (ビルド時にエラーにする)
+std::string QueryAiConversion(const std::string& history_context, const std::string& kana, const std::vector<std::string>& candidates) {
     #ifndef _WIN32
     #error "_WIN32 is not defined! Windows APIs will fail."
     #endif
 
     static const char* kPipeName = "\\\\.\\pipe\\MozcBertPipe";
+    
+    // データ作成: 文脈 TAB 読み TAB 候補1 TAB 候補2 ...
     std::string payload = history_context + "\t" + kana;
+    for (const auto& cand : candidates) {
+        payload += "\t" + cand;
+    }
+
     char buffer[4096];
     DWORD bytesRead = 0;
 
-    // ログ: 接続開始
-    DebugLog("[MozcAI] Connecting... Input: %s (CtxLen: %d)\n", kana.c_str(), history_context.size());
+    // DebugLog("[MozcAI] Connecting... Input: %s Candidates: %d\n", kana.c_str(), candidates.size());
 
     // 接続・送信・受信 (2秒タイムアウト)
     BOOL success = ::CallNamedPipeA(
@@ -120,11 +124,11 @@ std::string QueryAiConversion(const std::string& history_context, const std::str
 
     if (success) {
         std::string result(buffer, bytesRead);
-        DebugLog("[MozcAI] Success! Response: %s\n", result.c_str());
+        DebugLog("[MozcAI] Success! AI Selected: %s\n", result.c_str());
         return result;
     } else {
-        DWORD err = ::GetLastError();
-        DebugLog("[MozcAI] Failed. ErrorCode: %d\n", err);
+        // DWORD err = ::GetLastError();
+        // DebugLog("[MozcAI] Failed. ErrorCode: %d\n", err);
         return "";
     }
 }
@@ -578,9 +582,7 @@ bool Converter::ResizeSegments(Segments* segments,
 
 void Converter::ApplyConversion(Segments* segments,
                                 const ConversionRequest& request) const {
-  // ▼▼▼ 追加: 呼び出し確認ログ ▼▼▼
-  // request_typeの値をログに出す (1=CONVERSION)
-  DebugLog("[MozcAI] ApplyConversion called. Type: %d\n", request.request_type());
+  // DebugLog("[MozcAI] ApplyConversion called. Type: %d\n", request.request_type());
 
   // 1. まずMozc標準エンジンで全候補を出す
   if (!immutable_converter_->Convert(request, segments)) {
@@ -590,19 +592,26 @@ void Converter::ApplyConversion(Segments* segments,
   // 2. AIによるリランク処理（変換モード時のみ）
   if (request.request_type() == ConversionRequest::CONVERSION) {
     
-    // まず「確定済みの過去ログ」を文脈の初期値にする
     std::string current_context = GetHistoryContext(*segments);
 
-    // ★ここが重要：文節(Segment)を左から右へ順番に処理するループ
+    // 文節ごとに処理
     for (size_t i = 0; i < segments->conversion_segments_size(); ++i) {
         Segment *seg = segments->mutable_conversion_segment(i);
         std::string key(seg->key().data(), seg->key().size());
 
-        // 文脈 + 現在の読み をAIに投げる
-        std::string ai_result = QueryAiConversion(current_context, key);
+        // ★修正点：Mozcが出した候補リストを取得する
+        std::vector<std::string> candidate_list;
+        // 上位20件程度を送る（多すぎると通信エラーになるため制限）
+        int limit = std::min((int)seg->candidates_size(), 20);
+        for (int k = 0; k < limit; ++k) {
+            candidate_list.push_back(seg->candidate(k).value);
+        }
+
+        // 文脈 + 読み + 「候補リスト」をAIに投げる
+        std::string ai_result = QueryAiConversion(current_context, key, candidate_list);
 
         if (!ai_result.empty()) {
-            // AIの答えがあれば、候補の先頭にねじ込む
+            // AIが選んだ候補を先頭に挿入
             Candidate *cand = seg->push_back_candidate();
             cand->key = key;
             cand->content_key = key;
@@ -613,16 +622,13 @@ void Converter::ApplyConversion(Segments* segments,
             cand->lid = 0; 
             cand->rid = 0;
             
-            // 0番目（最優先）へ移動
+            // 最優先に移動
             if (seg->candidates_size() > 1) {
                 seg->move_candidate(seg->candidates_size() - 1, 0);
             }
 
-            // 【バケツリレー】
-            // AIが出した答えを、次の文節のための「文脈」に追加する
             current_context += ai_result;
         } else {
-            // AIが答えられなかった場合、Mozcの第1候補を文脈として採用して次に進む
             if (seg->candidates_size() > 0) {
                 current_context += seg->candidate(0).value;
             }
