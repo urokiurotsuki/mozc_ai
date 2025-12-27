@@ -80,9 +80,8 @@ namespace {
 // ==========================================
 
 // PythonのNamed Pipeサーバーに接続して変換候補をもらう関数
-std::string QueryAiConversion(const std::string& input_text) {
+std::string QueryAiConversion(const std::string& history_context, const std::string& kana) {
 #ifdef _WIN32
-    // Windows APIを呼ぶときはグローバルスコープ演算子(::)をつけるのが安全
     HANDLE hPipe = ::CreateFileA(
         "\\\\.\\pipe\\MozcBertPipe",
         GENERIC_READ | GENERIC_WRITE,
@@ -93,8 +92,12 @@ std::string QueryAiConversion(const std::string& input_text) {
         return "";
     }
 
+    // フォーマット: "文脈(TAB)読み"
+    // 例: "昨日のイベントでの\tきしゃ"
+    std::string payload = history_context + "\t" + kana;
+
     DWORD dwWritten;
-    ::WriteFile(hPipe, input_text.c_str(), input_text.size(), &dwWritten, NULL);
+    ::WriteFile(hPipe, payload.c_str(), payload.size(), &dwWritten, NULL);
 
     char buffer[4096];
     DWORD dwRead;
@@ -107,6 +110,19 @@ std::string QueryAiConversion(const std::string& input_text) {
     ::CloseHandle(hPipe);
 #endif
     return "";
+}
+
+// ▼▼▼ 追加: Mozcの履歴から文脈を抽出する関数 ▼▼▼
+std::string GetHistoryContext(const Segments& segments) {
+    std::string history = "";
+    // 履歴セグメント（確定済みの文字列）を走査して結合
+    for (size_t i = 0; i < segments.history_segments_size(); ++i) {
+        const Segment& seg = segments.history_segment(i);
+        if (seg.candidates_size() > 0) {
+            history += seg.candidate(0).value;
+        }
+    }
+    return history;
 }
 // ==========================================
 // [追記終了]
@@ -544,45 +560,67 @@ bool Converter::ResizeSegments(Segments* segments,
   return true;
 }
 
+std::string GetHistoryContext(const Segments& segments) {
+  std::string history = "";
+  for (size_t i = 0; i < segments.history_segments_size(); ++i) {
+    const Segment& seg = segments.history_segment(i);
+    if (seg.candidates_size() > 0) {
+      history += seg.candidate(0).value;
+    }
+  }
+  return history;
+}
+
 void Converter::ApplyConversion(Segments* segments,
                                 const ConversionRequest& request) const {
+  // 1. まずMozc標準エンジンで全候補を出す
   if (!immutable_converter_->Convert(request, segments)) {
     MOZC_VLOG(1) << "Convert failed for key: " << segments->segment(0).key();
   }
 
-  // ▼▼▼ [修正] AI呼び出し処理 ▼▼▼
-  if (request.request_type() == ConversionRequest::CONVERSION &&
-      segments->conversion_segments_size() > 0) {
-      
-    Segment *seg = segments->mutable_conversion_segment(0);
+  // 2. AIによるリランク処理（変換モード時のみ）
+  if (request.request_type() == ConversionRequest::CONVERSION) {
     
-    // 【修正】absl::string_view から std::string への正しい変換
-    std::string key(seg->key().data(), seg->key().size());
+    // まず「確定済みの過去ログ」を文脈の初期値にする
+    std::string current_context = GetHistoryContext(*segments);
 
-    std::string ai_result = QueryAiConversion(key);
+    // ★ここが重要：文節(Segment)を左から右へ順番に処理するループ
+    for (size_t i = 0; i < segments->conversion_segments_size(); ++i) {
+        Segment *seg = segments->mutable_conversion_segment(i);
+        std::string key(seg->key().data(), seg->key().size());
 
-    if (!ai_result.empty()) {
-       Candidate *cand = seg->push_back_candidate();
-       
-       // 【修正】Init()は使わず、直接代入する
-       cand->key = key;
-       cand->content_key = key;
-       cand->value = ai_result;
-       cand->content_value = ai_result;
-       cand->cost = 0;
-       cand->structure_cost = 0;
-       
-       // その他の属性も念のため初期化
-       cand->lid = 0; 
-       cand->rid = 0;
+        // 文脈 + 現在の読み をAIに投げる
+        std::string ai_result = QueryAiConversion(current_context, key);
 
-       // 0番目に移動
-       if (seg->candidates_size() > 1) {
-         seg->move_candidate(seg->candidates_size() - 1, 0);
-       }
+        if (!ai_result.empty()) {
+            // AIの答えがあれば、候補の先頭にねじ込む
+            Candidate *cand = seg->push_back_candidate();
+            cand->key = key;
+            cand->content_key = key;
+            cand->value = ai_result;
+            cand->content_value = ai_result;
+            cand->cost = 0;
+            cand->structure_cost = 0;
+            cand->lid = 0; 
+            cand->rid = 0;
+            
+            // 0番目（最優先）へ移動
+            if (seg->candidates_size() > 1) {
+                seg->move_candidate(seg->candidates_size() - 1, 0);
+            }
+
+            // 【バケツリレー】
+            // AIが出した答えを、次の文節のための「文脈」に追加する
+            current_context += ai_result;
+        } else {
+            // AIが答えられなかった場合、Mozcの第1候補を文脈として採用して次に進む
+            if (seg->candidates_size() > 0) {
+                current_context += seg->candidate(0).value;
+            }
+        }
     }
   }
-  // ▲▲▲▲▲▲▲ [ここまで追加] ▲▲▲▲▲▲▲
+
   ApplyPostProcessing(request, segments);
 }
 
