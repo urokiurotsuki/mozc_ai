@@ -1,4 +1,4 @@
-name: Windows Build
+name: Build AI Mozc (x64)
 
 on:
   push:
@@ -6,29 +6,55 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
-    runs-on: windows-2019
+  build_x64:
+    # 安定版のWindows環境を使用
+    runs-on: windows-2022
+    timeout-minutes: 120
 
     steps:
-    - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
-    - name: Setup Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.9'
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
 
-    - name: Install Dependencies
-      run: |
-        pip install six requests
-        choco install bazelisk -y
+      - name: Install Python deps
+        run: pip install six requests
 
-    - name: Build Mozc (Server & Renderer & Tool)
-      run: |
-        $env:BAZEL_VC = "C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC"
-        bazelisk build --config=oss_windows //src/win32/installer:mozc_installer
+      # ▼▼▼ ここが重要：Mozcに必要なライブラリを全部自動で揃える ▼▼▼
+      - name: Install Dependencies
+        working-directory: ./src
+        run: python build_tools/update_deps.py
 
-    - name: Upload Installer
-      uses: actions/upload-artifact@v4
-      with:
-        name: MyAiMozc_Installer
-        path: bazel-bin/src/win32/installer/*.msi
+      # ▼▼▼ Qt（GUI用ライブラリ）のビルド。これがないとインストーラーが作れません ▼▼▼
+      # ※これには数十分かかりますが、正常です。
+      - name: Build Qt
+        working-directory: ./src
+        run: python build_tools/build_qt.py --release --confirm_license
+
+      # ディスク容量節約のため、ビルド終わったQtのソースを消す
+      - name: Clean Qt Source
+        working-directory: ./src
+        shell: cmd
+        run: rmdir third_party\qt_src /s /q
+
+      # ▼▼▼ メインのビルド処理 ▼▼▼
+      - name: Build Mozc Installer
+        working-directory: ./src
+        env:
+          ANDROID_NDK_HOME: ""
+        run: |
+          # 公式と同じコマンドでパッケージを作成
+          bazelisk build --config oss_windows --config release_build package
+
+      # ▼▼▼ 生成されたインストーラーをアップロード ▼▼▼
+      - name: Upload Installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: MyAiMozc_Installer
+          # ビルド成果物は src/bazel-bin の下にできます
+          path: src/bazel-bin/win32/installer/*.msi
