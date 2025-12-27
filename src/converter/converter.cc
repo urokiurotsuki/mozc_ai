@@ -72,6 +72,54 @@ namespace mozc {
 namespace converter {
 namespace {
 
+// ==========================================
+// [追記開始] AI Server (Named Pipe) Client
+// ==========================================
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+// 既存のincludeと重複していてもガードされるので大丈夫ですが、
+// 気になるなら重複分（<string>, <vector>等）は消してください
+
+// ★namespace mozc { namespace {  <-- これを書かないのがポイント！
+
+// PythonのNamed Pipeサーバーに接続して変換候補をもらう関数
+std::string QueryAiConversion(const std::string& input_text) {
+#ifdef _WIN32
+    // 1. パイプに接続
+    HANDLE hPipe = CreateFileA(
+        "\\\\.\\pipe\\MozcBertPipe", // パイプ名
+        GENERIC_READ | GENERIC_WRITE,
+        0, NULL, OPEN_EXISTING, 0, NULL
+    );
+
+    if (hPipe == INVALID_HANDLE_VALUE) {
+        return ""; // サーバーがいなければ何もしない
+    }
+
+    // 2. 送信 (入力テキスト)
+    DWORD dwWritten;
+    WriteFile(hPipe, input_text.c_str(), input_text.size(), &dwWritten, NULL);
+
+    // 3. 受信 (AIからの変換結果)
+    char buffer[4096];
+    DWORD dwRead;
+    // ブロッキングで待機（※実用時はタイムアウト設定推奨）
+    if (ReadFile(hPipe, buffer, sizeof(buffer) - 1, &dwRead, NULL)) {
+        buffer[dwRead] = '\0';
+        CloseHandle(hPipe);
+        return std::string(buffer);
+    }
+
+    CloseHandle(hPipe);
+#endif
+    return "";
+}
+// ==========================================
+// [追記終了]
+// ==========================================
+
 constexpr size_t kErrorIndex = static_cast<size_t>(-1);
 
 size_t GetSegmentIndex(const Segments* segments, size_t segment_index) {
