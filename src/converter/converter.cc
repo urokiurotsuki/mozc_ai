@@ -236,7 +236,7 @@ bool QueryAiConversionBatch(const std::string& history_context,
             // 既に先頭
             same_count++;
         } else {
-            // 候補リストにない場合は新規追加
+            // 候補リストにない場合は新規追加（AI拡張辞書から）
             std::string reading(seg->key().data(), seg->key().size());
             Candidate* cand = seg->push_back_candidate();
             cand->key = reading;
@@ -245,8 +245,16 @@ bool QueryAiConversionBatch(const std::string& history_context,
             cand->content_value = selected;
             cand->cost = 0;
             cand->structure_cost = 0;
-            cand->lid = 0;
-            cand->rid = 0;
+            
+            // 品詞IDは元の候補からコピー（接続コスト計算のため）
+            if (seg->candidates_size() > 1) {
+                const Candidate& first = seg->candidate(0);
+                cand->lid = first.lid;
+                cand->rid = first.rid;
+            } else {
+                cand->lid = 0;
+                cand->rid = 0;
+            }
             cand->attributes |= Attribute::RERANKED;
             
             if (seg->candidates_size() > 1) {
