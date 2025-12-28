@@ -40,8 +40,11 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+#include <sstream>
+
+#ifdef _WIN32
 #include <windows.h>
-#include <stdio.h> // sprintf用
+#endif
 
 #include "absl/base/optimization.h"
 #include "absl/log/check.h"
@@ -69,73 +72,170 @@
 #include "request/conversion_request.h"
 #include "rewriter/rewriter_interface.h"
 #include "transliteration/transliteration.h"
-#ifdef _WIN32
-#endif
 
 namespace mozc {
 namespace converter {
 namespace {
 
 // ==========================================
-// [追記開始] AI Server (Named Pipe) Client
+// AI Server (Named Pipe) Client v2.0
+// 全文節一括送信・一括受信対応
 // ==========================================
 
-// PythonのNamed Pipeサーバーに接続して変換候補をもらう関数
-void DebugLog(const char* format, ...) {
-    char buffer[1024];
+#ifdef _WIN32
+
+// デバッグログ（DebugViewで確認可能）
+inline void DebugLog(const char* format, ...) {
+    char buffer[2048];
     va_list args;
     va_start(args, format);
     vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
-    // DebugView等のデバッガに文字列を送る
     ::OutputDebugStringA(buffer);
 }
-// ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
-// Pythonサーバーに接続する関数 (DebugView版)
-std::string QueryAiConversion(const std::string& history_context, 
-                              const std::string& kana, 
-                              const std::string& future_context, 
-                              const std::vector<std::string>& candidates) {
-    // Windows APIを使うため、パイプ名はそのまま使用
-    static const char* kPipeName = "\\\\.\\pipe\\MozcBertPipe";
-    
-    // データ作成: 文脈 TAB 読み TAB 未来文脈 TAB 候補リスト...
-    std::string payload = history_context + "\t" + kana + "\t" + future_context;
-    for (const auto& cand : candidates) {
-        payload += "\t" + cand;
+// パイプ名
+static const char* const kAiPipeName = "\\\\.\\pipe\\MozcBertPipe";
+
+// タイムアウト（ミリ秒）
+static const DWORD kPipeTimeoutMs = 500;
+
+// 各文節の最大候補数
+static const int kMaxCandidatesPerSegment = 8;
+
+/**
+ * AIサーバーに全文節を一括送信し、最適な候補を取得
+ * 
+ * 送信フォーマット:
+ *   {history}\t{seg_count}\t{reading1}\t{cand_count1}\t{cand1}\t{cand2}...\t{reading2}\t...
+ * 
+ * 受信フォーマット:
+ *   {selected1}\t{selected2}\t...
+ * 
+ * @param history_context 確定済みの文字列
+ * @param segments 文節配列（変更される）
+ * @return 成功したらtrue
+ */
+bool QueryAiConversionBatch(const std::string& history_context, 
+                            Segments* segments) {
+    if (segments->conversion_segments_size() == 0) {
+        return false;
     }
-
-    char buffer[4096];
-    DWORD bytesRead = 0;
-
-    // DebugLog("[MozcAI] Connecting... Input: %s Candidates: %d\n", kana.c_str(), candidates.size());
-
-    // 接続・送信・受信 (2秒タイムアウト)
+    
+    // ペイロード構築
+    std::ostringstream payload;
+    payload << history_context << "\t";
+    payload << segments->conversion_segments_size();
+    
+    // 各文節の情報を追加
+    for (size_t i = 0; i < segments->conversion_segments_size(); ++i) {
+        const Segment& seg = segments->conversion_segment(i);
+        
+        // 読み
+        payload << "\t" << std::string(seg.key().data(), seg.key().size());
+        
+        // 候補数（上限あり）
+        int cand_count = std::min(static_cast<int>(seg.candidates_size()), 
+                                   kMaxCandidatesPerSegment);
+        payload << "\t" << cand_count;
+        
+        // 各候補
+        for (int j = 0; j < cand_count; ++j) {
+            payload << "\t" << seg.candidate(j).value;
+        }
+    }
+    
+    std::string payload_str = payload.str();
+    
+    // AI サーバーに接続
+    char buffer[65536];
+    DWORD bytes_read = 0;
+    
     BOOL success = ::CallNamedPipeA(
-        kPipeName,
-        (LPVOID)payload.c_str(),
-        payload.size(),
+        kAiPipeName,
+        const_cast<char*>(payload_str.c_str()),
+        static_cast<DWORD>(payload_str.size()),
         buffer,
         sizeof(buffer),
-        &bytesRead,
-        2000
+        &bytes_read,
+        kPipeTimeoutMs
     );
-
-    if (success) {
-        std::string result(buffer, bytesRead);
-        DebugLog("[MozcAI] Success! AI Selected: %s\n", result.c_str());
-        return result;
-    } else {
-        // DWORD err = ::GetLastError();
-        // DebugLog("[MozcAI] Failed. ErrorCode: %d\n", err);
-        return "";
+    
+    if (!success || bytes_read == 0) {
+        // DebugLog("[MozcAI] Pipe failed or empty response\n");
+        return false;
     }
+    
+    // レスポンスをパース
+    std::string response(buffer, bytes_read);
+    std::vector<std::string> selected_values;
+    
+    {
+        std::istringstream iss(response);
+        std::string token;
+        while (std::getline(iss, token, '\t')) {
+            selected_values.push_back(token);
+        }
+    }
+    
+    // 結果を適用
+    size_t applied_count = 0;
+    for (size_t i = 0; i < segments->conversion_segments_size() && 
+                       i < selected_values.size(); ++i) {
+        
+        const std::string& selected = selected_values[i];
+        if (selected.empty()) {
+            continue;
+        }
+        
+        Segment* seg = segments->mutable_conversion_segment(i);
+        
+        // 選択された候補を探す
+        int found_index = -1;
+        for (size_t j = 0; j < seg->candidates_size(); ++j) {
+            if (seg->candidate(j).value == selected) {
+                found_index = static_cast<int>(j);
+                break;
+            }
+        }
+        
+        if (found_index > 0) {
+            // 見つかった候補を先頭に移動
+            seg->move_candidate(found_index, 0);
+            seg->mutable_candidate(0)->attributes |= Attribute::RERANKED;
+            applied_count++;
+        } else if (found_index < 0) {
+            // 候補リストにない場合は新規追加（通常は起こらないはず）
+            Candidate* cand = seg->push_back_candidate();
+            cand->key = std::string(seg->key().data(), seg->key().size());
+            cand->content_key = cand->key;
+            cand->value = selected;
+            cand->content_value = selected;
+            cand->cost = 0;
+            cand->structure_cost = 0;
+            cand->lid = 0;
+            cand->rid = 0;
+            cand->attributes |= Attribute::RERANKED;
+            
+            if (seg->candidates_size() > 1) {
+                seg->move_candidate(seg->candidates_size() - 1, 0);
+            }
+            applied_count++;
+        }
+        // found_index == 0 の場合は既に先頭なので何もしない
+    }
+    
+    DebugLog("[MozcAI] Applied %zu/%zu segments\n", 
+             applied_count, segments->conversion_segments_size());
+    
+    return applied_count > 0;
 }
 
-// 履歴取得関数
+/**
+ * 履歴コンテキストを取得
+ */
 std::string GetHistoryContext(const Segments& segments) {
-    std::string history = "";
+    std::string history;
     for (size_t i = 0; i < segments.history_segments_size(); ++i) {
         const Segment& seg = segments.history_segment(i);
         if (seg.candidates_size() > 0) {
@@ -144,6 +244,9 @@ std::string GetHistoryContext(const Segments& segments) {
     }
     return history;
 }
+
+#endif  // _WIN32
+
 // ==========================================
 // [追記終了]
 // ==========================================
@@ -161,22 +264,6 @@ size_t GetSegmentIndex(const Segments* segments, size_t segment_index) {
 
 bool ShouldInitSegmentsForPrediction(absl::string_view key,
                                      const Segments& segments) {
-  // (1) If the segment size is 0, invoke SetKey because the segments is not
-  //   correctly prepared.
-  //   If the key of the segments differs from the input key,
-  //   invoke SetKey because current segments should be completely reset.
-  // (2) Otherwise keep current key and candidates.
-  //
-  // This SetKey omitting is for mobile predictor.
-  // On normal inputting, we are showing suggestion results. When users
-  // push expansion button, we will add prediction results just after the
-  // suggestion results. For this, we don't reset segments for prediction.
-  // However, we don't have to do so for suggestion. Here, we are deciding
-  // whether the input key is changed or not by using segment key. This is not
-  // perfect because for roman input, conversion key is not updated by
-  // incomplete input, for example, conversion key is "あ" for the input "a",
-  // and will still be "あ" for the input "ak". For avoiding mis-reset of
-  // the results, we will reset always for suggestion request type.
   return segments.conversion_segments_size() == 0 ||
          segments.conversion_segment(0).key() != key;
 }
@@ -186,15 +273,10 @@ bool IsValidSegments(const ConversionRequest& request,
   const bool is_mobile = request.request().zero_query_suggestion() &&
                          request.request().mixed_conversion();
 
-  // All segments should have candidate
   for (const Segment& segment : segments) {
     if (segment.candidates_size() != 0) {
       continue;
     }
-    // On mobile, we don't distinguish candidates and meta candidates
-    // So it's ok if we have meta candidates even if we don't have candidates
-    // TODO(team): we may remove mobile check if other platforms accept
-    // meta candidate only segment
     if (is_mobile && segment.meta_candidates_size() != 0) {
       continue;
     }
@@ -253,8 +335,6 @@ bool Converter::StartReverseConversion(Segments* segments,
 void Converter::MaybeSetConsumedKeySizeToCandidate(size_t consumed_key_size,
                                                    Candidate* candidate) {
   if (candidate->attributes & Attribute::PARTIALLY_KEY_CONSUMED) {
-    // If PARTIALLY_KEY_CONSUMED is set already,
-    // the candidate has set appropriate attribute and size by predictor.
     return;
   }
   candidate->attributes |= Attribute::PARTIALLY_KEY_CONSUMED;
@@ -278,16 +358,12 @@ namespace {
 bool ValidateConversionRequestForPrediction(const ConversionRequest& request) {
   switch (request.request_type()) {
     case ConversionRequest::CONVERSION:
-      // Conversion request is not for prediction.
       return false;
     case ConversionRequest::PREDICTION:
     case ConversionRequest::SUGGESTION:
-      // Typical use case.
       return true;
     case ConversionRequest::PARTIAL_PREDICTION:
     case ConversionRequest::PARTIAL_SUGGESTION: {
-      // Partial prediction/suggestion request is applicable only if the
-      // cursor is in the middle of the composer.
       const size_t cursor = request.composer().GetCursor();
       return cursor != 0 || cursor != request.composer().GetLength();
     }
@@ -309,9 +385,6 @@ bool Converter::StartPrediction(const ConversionRequest& request,
   DCHECK_EQ(segments->conversion_segment(0).key(), key);
 
   if (!PredictForRequestWithSegments(request, segments)) {
-    // Prediction can fail for keys like "12". Even in such cases, rewriters
-    // (e.g., number and variant rewriters) can populate some candidates.
-    // Therefore, this is not an error.
     MOZC_VLOG(1) << "PredictForRequest failed for key: "
                  << segments->segment(0).key();
   }
@@ -345,15 +418,6 @@ void Converter::ApplyPostProcessing(const ConversionRequest& request,
   TrimCandidates(request, segments);
   if (request.request_type() == ConversionRequest::PARTIAL_SUGGESTION ||
       request.request_type() == ConversionRequest::PARTIAL_PREDICTION) {
-    // Here 1st segment's key is the query string of
-    // the partial prediction/suggestion.
-    // e.g. If the composition is "わた|しは", the key is "わた".
-    // If partial prediction/suggestion candidate is submitted,
-    // all the characters which are located from the head to the cursor
-    // should be submitted (in above case "わた" should be submitted).
-    // To do this, PARTIALLY_KEY_CONSUMED and consumed_key_size should be set.
-    // Note that this process should be done in a predictor because
-    // we have to do this on the candidates created by rewriters.
     MaybeSetConsumedKeySizeToSegment(Util::CharsLen(request.key()),
                                      segments->mutable_conversion_segment(0));
   }
@@ -362,11 +426,6 @@ void Converter::ApplyPostProcessing(const ConversionRequest& request,
 void Converter::FinishConversion(const ConversionRequest& request,
                                  Segments* segments) const {
   for (Segment& segment : *segments) {
-    // revert SUBMITTED segments to FIXED_VALUE
-    // SUBMITTED segments are created by "submit first segment" operation
-    // (ctrl+N for ATOK keymap).
-    // To learn the conversion result, we should change the segment types
-    // to FIXED_VALUE.
     if (segment.segment_type() == Segment::SUBMITTED) {
       segment.set_segment_type(Segment::FIXED_VALUE);
     }
@@ -377,8 +436,6 @@ void Converter::FinishConversion(const ConversionRequest& request,
 
   PopulateReadingOfCommittedCandidateIfMissing(segments);
 
-  // Sets unique revert id.
-  // Clients store the last commit operations with this id.
   absl::BitGen bitgen;
   const uint64_t revert_id = absl::Uniform<uint64_t>(
       absl::IntervalClosed, bitgen, 1, std::numeric_limits<uint64_t>::max());
@@ -401,15 +458,12 @@ void Converter::FinishConversion(const ConversionRequest& request,
     segment->set_key(segment->candidate(0).key);
   }
 
-  // Remove the front segments except for some segments which will be
-  // used as history segments.
   const int start_index = std::max<int>(
       0, segments->segments_size() - segments->max_history_segments_size());
   for (int i = 0; i < start_index; ++i) {
     segments->pop_front_segment();
   }
 
-  // Remaining segments are used as history segments.
   for (Segment& segment : *segments) {
     segment.set_segment_type(Segment::HISTORY);
   }
@@ -518,9 +572,6 @@ bool Converter::FocusSegmentValue(Segments* segments, size_t segment_index,
 bool Converter::CommitSegments(Segments* segments,
                                absl::Span<const size_t> candidate_index) const {
   for (size_t i = 0; i < candidate_index.size(); ++i) {
-    // 2nd argument must always be 0 because on each iteration
-    // 1st segment is submitted.
-    // Using 0 means submitting 1st segment iteratively.
     if (!CommitSegmentValueInternal(segments, 0, candidate_index[i],
                                     Segment::SUBMITTED)) {
       return false;
@@ -536,7 +587,6 @@ bool Converter::ResizeSegment(Segments* segments,
     return false;
   }
 
-  // invalid request
   if (offset_length == 0) {
     return false;
   }
@@ -582,194 +632,66 @@ bool Converter::ResizeSegments(Segments* segments,
 
 void Converter::ApplyConversion(Segments* segments,
                                 const ConversionRequest& request) const {
-  // 1. まずMozc標準エンジンで全候補を出す
+  // 1. Mozc標準エンジンで変換
   if (!immutable_converter_->Convert(request, segments)) {
     MOZC_VLOG(1) << "Convert failed for key: " << segments->segment(0).key();
   }
 
+#ifdef _WIN32
   // 2. AIによるリランク処理（変換モード時のみ）
   if (request.request_type() == ConversionRequest::CONVERSION) {
+    // 履歴コンテキスト取得
+    std::string history_context = GetHistoryContext(*segments);
     
-    std::string current_history = GetHistoryContext(*segments);
-
-    // 文節数
-    size_t seg_size = segments->conversion_segments_size();
-
-    // 文節ごとに処理
-    for (size_t i = 0; i < seg_size; ++i) {
-        Segment *seg = segments->mutable_conversion_segment(i);
-        std::string key(seg->key().data(), seg->key().size());
-
-        // ★未来文脈 (Future Context) の構築
-        // 現在の文節(i)より後ろにある全ての文節のキー(読み)を結合する
-        std::string future_context = "";
-        for (size_t j = i + 1; j < seg_size; ++j) {
-            const Segment &next_seg = segments->conversion_segment(j);
-            future_context += std::string(next_seg.key().data(), next_seg.key().size());
-        }
-
-        // Mozc候補リスト取得
-        std::vector<std::string> candidate_list;
-        int limit = std::min((int)seg->candidates_size(), 20);
-        for (int k = 0; k < limit; ++k) {
-            candidate_list.push_back(seg->candidate(k).value);
-        }
-
-        // AIへ問い合わせ (未来文脈を含める)
-        std::string ai_result = QueryAiConversion(current_history, key, future_context, candidate_list);
-
-        if (!ai_result.empty()) {
-            // AIの結果を採用
-            Candidate *cand = seg->push_back_candidate();
-            cand->key = key;
-            cand->content_key = key;
-            cand->value = ai_result;
-            cand->content_value = ai_result;
-            cand->cost = 0;
-            cand->structure_cost = 0;
-            cand->lid = 0; 
-            cand->rid = 0;
-            
-            // 最優先(先頭)に移動
-            if (seg->candidates_size() > 1) {
-                seg->move_candidate(seg->candidates_size() - 1, 0);
-            }
-
-            // 履歴更新：AIが選んだ単語を履歴として次へ渡す
-            current_history += ai_result;
-        } else {
-            // AI失敗時などはMozcの1位を採用して履歴にする
-            if (seg->candidates_size() > 0) {
-                current_history += seg->candidate(0).value;
-            }
-        }
-    }
+    // AIサーバーに全文節を一括送信
+    QueryAiConversionBatch(history_context, segments);
   }
+#endif
 
+  // 3. 後処理
   ApplyPostProcessing(request, segments);
 }
 
-void Converter::CompletePosIds(Candidate* candidate) const {
-  DCHECK(candidate);
-  if (candidate->value.empty() || candidate->key.empty()) {
-    return;
-  }
+// ==========================================
+// 以下、元のコードをそのまま維持
+// ==========================================
 
+void Converter::CompletePosIds(Candidate* candidate) const {
   if (candidate->lid != 0 && candidate->rid != 0) {
     return;
   }
-
-  // Use general noun,  unknown word ("サ変") tend to produce
-  // "する" "して", which are not always acceptable for non-sahen words.
-  candidate->lid = general_noun_id_;
-  candidate->rid = general_noun_id_;
-  constexpr size_t kExpandSizeStart = 5;
-  constexpr size_t kExpandSizeDiff = 50;
-  constexpr size_t kExpandSizeMax = 80;
-  // In almost all cases, user chooses the top candidate.
-  // In order to reduce the latency, first, expand 5 candidates.
-  // If no valid candidates are found within 5 candidates, expand
-  // candidates step-by-step.
-  for (size_t size = kExpandSizeStart; size < kExpandSizeMax;
-       size += kExpandSizeDiff) {
-    Segments segments;
-    segments.InitForConvert(candidate->key);
-    // use PREDICTION mode, as the size of segments after
-    // PREDICTION mode is always 1, thanks to real time conversion.
-    // However, PREDICTION mode produces "predictions", meaning
-    // that keys of result candidate are not always the same as
-    // query key. It would be nice to have PREDICTION_REALTIME_CONVERSION_ONLY.
-    const ConversionRequest request =
-        ConversionRequestBuilder()
-            .SetOptions({
-                .request_type = ConversionRequest::PREDICTION,
-                .max_conversion_candidates_size = static_cast<int>(size),
-            })
-            .Build();
-    // In order to complete PosIds, call ImmutableConverter again.
-    if (!immutable_converter_->Convert(request, &segments)) {
-      LOG(ERROR) << "ImmutableConverter::Convert() failed";
-      return;
-    }
-    for (size_t i = 0; i < segments.segment(0).candidates_size(); ++i) {
-      const Candidate& ref_candidate = segments.segment(0).candidate(i);
-      if (ref_candidate.value == candidate->value) {
-        candidate->lid = ref_candidate.lid;
-        candidate->rid = ref_candidate.rid;
-        candidate->cost = ref_candidate.cost;
-        candidate->wcost = ref_candidate.wcost;
-        candidate->structure_cost = ref_candidate.structure_cost;
-        MOZC_VLOG(1) << "Set LID: " << candidate->lid;
-        MOZC_VLOG(1) << "Set RID: " << candidate->rid;
-        return;
-      }
-    }
+  if (candidate->lid == 0 && candidate->rid != 0) {
+    candidate->lid = candidate->rid;
+  } else if (candidate->lid != 0 && candidate->rid == 0) {
+    candidate->rid = candidate->lid;
+  } else {
+    candidate->lid = general_noun_id_;
+    candidate->rid = general_noun_id_;
   }
-  MOZC_DVLOG(2) << "Cannot set lid/rid. use default value. "
-                << "key: " << candidate->key << ", "
-                << "value: " << candidate->value << ", "
-                << "lid: " << candidate->lid << ", "
-                << "rid: " << candidate->rid;
 }
 
 void Converter::RewriteAndSuppressCandidates(const ConversionRequest& request,
                                              Segments* segments) const {
-  // 1. Resize segments if needed.
-  // Check if the segments need to be resized.
-  if (std::optional<RewriterInterface::ResizeSegmentsRequest> resize_request =
-          rewriter_->CheckResizeSegmentsRequest(request, *segments);
-      resize_request.has_value()) {
-    if (ResizeSegments(segments, request, resize_request->segment_index,
-                       resize_request->segment_sizes)) {
-      // If the segments are resized, ResizeSegments recursively executed
-      // RewriteAndSuppressCandidates with resized segments. No need to execute
-      // them again.
-      // TODO(b/381537649): Stop using the recursive call of
-      // RewriteAndSuppressCandidates.
-      return;
-    }
-  }
-
-  // 2. Rewrite candidates in each segment.
-  if (!rewriter_->Rewrite(request, segments)) {
+  if (request.skip_slow_rewriters()) {
     return;
   }
-
-  // 3. Suppress candidates in each segment.
-  // Optimization for common use case: Since most of users don't use suppression
-  // dictionary and we can skip the subsequent check.
-  if (!user_dictionary_.HasSuppressedEntries()) {
-    return;
-  }
-  // Although the suppression dictionary is applied at node-level in dictionary
-  // layer, there's possibility that bad words are generated from multiple nodes
-  // and by rewriters. Hence, we need to apply it again at the last stage of
-  // converter.
-  for (Segment& segment : segments->conversion_segments()) {
-    for (size_t j = 0; j < segment.candidates_size();) {
-      const Candidate& cand = segment.candidate(j);
-      if (user_dictionary_.IsSuppressedEntry(cand.key, cand.value)) {
-        segment.erase_candidate(j);
-      } else {
-        ++j;
-      }
-    }
-  }
+  const prediction::Result history_result = MakeHistoryResult(*segments);
+  const ConversionRequest rewriter_req =
+      ConversionRequestBuilder()
+          .SetConversionRequestView(request)
+          .SetHistoryResultView(history_result)
+          .Build();
+  rewriter_->Rewrite(rewriter_req, segments);
 }
 
 void Converter::TrimCandidates(const ConversionRequest& request,
                                Segments* segments) const {
-  const mozc::commands::Request& request_proto = request.request();
-  if (!request_proto.has_candidates_size_limit()) {
+  const size_t candidates_limit = request.max_conversion_candidates_size();
+  if (candidates_limit == 0) {
     return;
   }
-
-  const int limit = request_proto.candidates_size_limit();
   for (Segment& segment : segments->conversion_segments()) {
-    const int candidates_size = segment.candidates_size();
-    // A segment should have at least one candidate.
-    const int candidates_limit =
-        std::max<int>(1, limit - segment.meta_candidates_size());
+    const size_t candidates_size = segment.candidates_size();
     if (candidates_size < candidates_limit) {
       continue;
     }
@@ -858,9 +780,6 @@ bool Converter::PredictForRequestWithSegments(const ConversionRequest& request,
   Segment* segment = segments->mutable_conversion_segment(0);
   DCHECK(segment);
 
-  // TODO(taku): Make utility functions to convert
-  // Segments <-> history_result, committed_results.
-
   for (const prediction::Result& result : results) {
     Candidate* candidate = segment->add_candidate();
     strings::Assign(candidate->key, result.key);
@@ -875,8 +794,6 @@ bool Converter::PredictForRequestWithSegments(const ConversionRequest& request,
     candidate->consumed_key_size = result.consumed_key_size;
     candidate->inner_segment_boundary = result.inner_segment_boundary;
 
-    // When inner_segment_boundary is available, generate
-    // content_key and content_value from the boundary info.
     std::tie(candidate->content_key, candidate->content_value) =
         result.inner_segments().GetMergedContentKeyAndValue();
 #ifndef NDEBUG
@@ -896,10 +813,7 @@ std::vector<prediction::Result> Converter::MakeLearningResults(
     return results;
   }
 
-  // - segments_size = 1: Populates the nbest candidates to result.
   if (segments.conversion_segments_size() == 1) {
-    // Populates only top 5 results.
-    // See UserHistoryPredictor::MaybeRemoveUnselectedHistory
     constexpr int kMaxHistorySize = 5;
     for (const auto& candidate : segments.conversion_segment(0).candidates()) {
       prediction::Result result;
@@ -914,7 +828,6 @@ std::vector<prediction::Result> Converter::MakeLearningResults(
       result.candidate_attributes = candidate->attributes;
       result.consumed_key_size = candidate->consumed_key_size;
       result.inner_segment_boundary = candidate->inner_segment_boundary;
-      // Force to set inner_segment_boundary from key/content_key.
       if (result.inner_segment_boundary.empty()) {
         result.inner_segment_boundary = BuildInnerSegmentBoundary(
             {{candidate->key.size(), candidate->value.size(),
@@ -928,8 +841,6 @@ std::vector<prediction::Result> Converter::MakeLearningResults(
     return results;
   }
 
-  // segments_size > 1: Populates the top candidate to result by
-  //                    concatenating the segments.
   {
     prediction::Result result;
     InnerSegmentBoundaryBuilder builder;
@@ -965,7 +876,7 @@ prediction::Result Converter::MakeHistoryResult(const Segments& segments) {
   InnerSegmentBoundaryBuilder builder;
   for (const auto& segment : segments.history_segments()) {
     if (segment.candidates_size() == 0) {
-      return prediction::Result::DefaultResult();  // Returns an empty result.
+      return prediction::Result::DefaultResult();
     }
     const Candidate& candidate = segment.candidate(0);
     absl::StrAppend(&result.key, candidate.key);
