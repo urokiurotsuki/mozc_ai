@@ -122,28 +122,47 @@ bool QueryAiConversionBatch(const std::string& history_context,
         return false;
     }
     
+    size_t seg_count = segments->conversion_segments_size();
+    
     // ペイロード構築
     std::ostringstream payload;
     payload << history_context << "\t";
-    payload << segments->conversion_segments_size();
+    payload << seg_count;
+    
+    // デバッグ：送信データをログに
+    std::ostringstream debug_send;
+    debug_send << "[MozcAI] >>> hist:" << history_context.length() << " segs:" << seg_count << " [";
     
     // 各文節の情報を追加
-    for (size_t i = 0; i < segments->conversion_segments_size(); ++i) {
+    for (size_t i = 0; i < seg_count; ++i) {
         const Segment& seg = segments->conversion_segment(i);
         
         // 読み
-        payload << "\t" << std::string(seg.key().data(), seg.key().size());
+        std::string reading(seg.key().data(), seg.key().size());
+        payload << "\t" << reading;
         
         // 候補数（上限あり）
         int cand_count = std::min(static_cast<int>(seg.candidates_size()), 
                                    kMaxCandidatesPerSegment);
         payload << "\t" << cand_count;
         
+        // デバッグ
+        debug_send << reading << "(";
+        
         // 各候補
         for (int j = 0; j < cand_count; ++j) {
-            payload << "\t" << seg.candidate(j).value;
+            std::string cand_val = seg.candidate(j).value;
+            payload << "\t" << cand_val;
+            if (j < 3) {  // 最初の3候補だけログに
+                debug_send << cand_val;
+                if (j < 2 && j < cand_count - 1) debug_send << "/";
+            }
         }
+        debug_send << ")";
+        if (i < seg_count - 1) debug_send << " ";
     }
+    debug_send << "]\n";
+    DebugLog("%s", debug_send.str().c_str());
     
     std::string payload_str = payload.str();
     
@@ -162,7 +181,7 @@ bool QueryAiConversionBatch(const std::string& history_context,
     );
     
     if (!success || bytes_read == 0) {
-        // DebugLog("[MozcAI] Pipe failed or empty response\n");
+        DebugLog("[MozcAI] Pipe failed: err=%d\n", ::GetLastError());
         return false;
     }
     
@@ -178,11 +197,20 @@ bool QueryAiConversionBatch(const std::string& history_context,
         }
     }
     
+    // デバッグ：AIからの応答をログに
+    std::ostringstream debug_recv;
+    debug_recv << "[MozcAI] <<< ";
+    for (size_t i = 0; i < selected_values.size(); ++i) {
+        debug_recv << "[" << selected_values[i] << "]";
+    }
+    debug_recv << "\n";
+    DebugLog("%s", debug_recv.str().c_str());
+    
     // 結果を適用
     size_t applied_count = 0;
-    for (size_t i = 0; i < segments->conversion_segments_size() && 
-                       i < selected_values.size(); ++i) {
-        
+    size_t same_count = 0;
+    
+    for (size_t i = 0; i < seg_count && i < selected_values.size(); ++i) {
         const std::string& selected = selected_values[i];
         if (selected.empty()) {
             continue;
@@ -204,11 +232,15 @@ bool QueryAiConversionBatch(const std::string& history_context,
             seg->move_candidate(found_index, 0);
             seg->mutable_candidate(0)->attributes |= Attribute::RERANKED;
             applied_count++;
-        } else if (found_index < 0) {
-            // 候補リストにない場合は新規追加（通常は起こらないはず）
+        } else if (found_index == 0) {
+            // 既に先頭
+            same_count++;
+        } else {
+            // 候補リストにない場合は新規追加
+            std::string reading(seg->key().data(), seg->key().size());
             Candidate* cand = seg->push_back_candidate();
-            cand->key = std::string(seg->key().data(), seg->key().size());
-            cand->content_key = cand->key;
+            cand->key = reading;
+            cand->content_key = reading;
             cand->value = selected;
             cand->content_value = selected;
             cand->cost = 0;
@@ -222,13 +254,12 @@ bool QueryAiConversionBatch(const std::string& history_context,
             }
             applied_count++;
         }
-        // found_index == 0 の場合は既に先頭なので何もしない
     }
     
-    DebugLog("[MozcAI] Applied %zu/%zu segments\n", 
-             applied_count, segments->conversion_segments_size());
+    DebugLog("[MozcAI] Result: applied=%zu same=%zu total=%zu\n", 
+             applied_count, same_count, seg_count);
     
-    return applied_count > 0;
+    return applied_count > 0 || same_count > 0;
 }
 
 /**
