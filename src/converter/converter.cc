@@ -288,10 +288,12 @@ std::string GetHistoryContext(const Segments& segments) {
 static const char* const kAiLearnPipeName = "\\\\.\\pipe\\MozcAILearnPipe";
 
 /**
- * 確定情報をAIサーバーに通知（学習用）
- * 非同期で送信し、失敗しても無視
+ * 確定情報をAIサーバーに通知（学習用）v2
+ * 文節全体を送信し、文節区切り変更時の誤学習を防止
  * 
  * フォーマット: LEARN\t{reading1}\t{value1}\t{reading2}\t{value2}...
+ * 
+ * 注: 文節区切りが変更された場合でも正しい情報を送信
  */
 void NotifyLearnToAI(const Segments& segments, 
                      absl::Span<const size_t> candidate_indices) {
@@ -299,20 +301,34 @@ void NotifyLearnToAI(const Segments& segments,
         return;
     }
     
+    // 変換セグメント数を確認
+    size_t conv_seg_count = segments.conversion_segments_size();
+    if (conv_seg_count == 0) {
+        return;
+    }
+    
     // ペイロード構築
     std::ostringstream payload;
     payload << "LEARN";
     
-    for (size_t i = 0; i < candidate_indices.size() && 
-                       i < segments.conversion_segments_size(); ++i) {
+    size_t sent_count = 0;
+    for (size_t i = 0; i < candidate_indices.size() && i < conv_seg_count; ++i) {
         const Segment& seg = segments.conversion_segment(i);
         size_t cand_idx = candidate_indices[i];
         
         if (cand_idx < seg.candidates_size()) {
+            // 読み（key）を取得
             std::string reading(seg.key().data(), seg.key().size());
+            // 確定値を取得
             std::string value = seg.candidate(cand_idx).value;
+            
             payload << "\t" << reading << "\t" << value;
+            sent_count++;
         }
+    }
+    
+    if (sent_count == 0) {
+        return;
     }
     
     std::string payload_str = payload.str();
@@ -321,18 +337,20 @@ void NotifyLearnToAI(const Segments& segments,
     char buffer[256];
     DWORD bytes_read = 0;
     
-    ::CallNamedPipeA(
+    BOOL result = ::CallNamedPipeA(
         kAiLearnPipeName,
         const_cast<char*>(payload_str.c_str()),
         static_cast<DWORD>(payload_str.size()),
         buffer,
         sizeof(buffer),
         &bytes_read,
-        50  // 50ms タイムアウト（短め）
+        50  // 50ms タイムアウト
     );
     
-    // 成功/失敗は無視（UIをブロックしない）
-    DebugLog("[MozcAI] Learn notify: %zu segments\n", candidate_indices.size());
+    if (result) {
+        DebugLog("[MozcAI] Learn notify: %zu segments sent\n", sent_count);
+    }
+    // 失敗は無視（UIをブロックしない）
 }
 
 #endif  // _WIN32
