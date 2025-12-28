@@ -284,6 +284,57 @@ std::string GetHistoryContext(const Segments& segments) {
     return history;
 }
 
+// 学習通知用パイプ名
+static const char* const kAiLearnPipeName = "\\\\.\\pipe\\MozcAILearnPipe";
+
+/**
+ * 確定情報をAIサーバーに通知（学習用）
+ * 非同期で送信し、失敗しても無視
+ * 
+ * フォーマット: LEARN\t{reading1}\t{value1}\t{reading2}\t{value2}...
+ */
+void NotifyLearnToAI(const Segments& segments, 
+                     absl::Span<const size_t> candidate_indices) {
+    if (candidate_indices.empty()) {
+        return;
+    }
+    
+    // ペイロード構築
+    std::ostringstream payload;
+    payload << "LEARN";
+    
+    for (size_t i = 0; i < candidate_indices.size() && 
+                       i < segments.conversion_segments_size(); ++i) {
+        const Segment& seg = segments.conversion_segment(i);
+        size_t cand_idx = candidate_indices[i];
+        
+        if (cand_idx < seg.candidates_size()) {
+            std::string reading(seg.key().data(), seg.key().size());
+            std::string value = seg.candidate(cand_idx).value;
+            payload << "\t" << reading << "\t" << value;
+        }
+    }
+    
+    std::string payload_str = payload.str();
+    
+    // 非同期で送信（タイムアウト短め）
+    char buffer[256];
+    DWORD bytes_read = 0;
+    
+    ::CallNamedPipeA(
+        kAiLearnPipeName,
+        const_cast<char*>(payload_str.c_str()),
+        static_cast<DWORD>(payload_str.size()),
+        buffer,
+        sizeof(buffer),
+        &bytes_read,
+        50  // 50ms タイムアウト（短め）
+    );
+    
+    // 成功/失敗は無視（UIをブロックしない）
+    DebugLog("[MozcAI] Learn notify: %zu segments\n", candidate_indices.size());
+}
+
 #endif  // _WIN32
 
 // ==========================================
@@ -610,6 +661,12 @@ bool Converter::FocusSegmentValue(Segments* segments, size_t segment_index,
 
 bool Converter::CommitSegments(Segments* segments,
                                absl::Span<const size_t> candidate_index) const {
+  // 確定前の情報を保存（学習通知用）
+#ifdef _WIN32
+  // 確定情報をAIに通知
+  NotifyLearnToAI(*segments, candidate_index);
+#endif
+
   for (size_t i = 0; i < candidate_index.size(); ++i) {
     if (!CommitSegmentValueInternal(segments, 0, candidate_index[i],
                                     Segment::SUBMITTED)) {
