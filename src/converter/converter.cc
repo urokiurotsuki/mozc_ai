@@ -97,11 +97,11 @@ inline void DebugLog(const char* format, ...) {
 // パイプ名
 static const char* const kAiPipeName = "\\\\.\\pipe\\MozcBertPipe";
 
-// タイムアウト（ミリ秒）
-static const DWORD kPipeTimeoutMs = 500;
+// タイムアウト（ミリ秒）- 短めに設定してフリーズを防止
+static const DWORD kPipeTimeoutMs = 100;
 
-// 各文節の最大候補数
-static const int kMaxCandidatesPerSegment = 8;
+// 各文節の最大候補数（速度のため削減）
+static const int kMaxCandidatesPerSegment = 4;
 
 /**
  * AIサーバーに全文節を一括送信し、最適な候補を取得
