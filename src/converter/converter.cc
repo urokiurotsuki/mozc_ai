@@ -93,15 +93,15 @@ void DebugLog(const char* format, ...) {
 // ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
 // Pythonサーバーに接続する関数 (DebugView版)
-std::string QueryAiConversion(const std::string& history_context, const std::string& kana, const std::vector<std::string>& candidates) {
-    #ifndef _WIN32
-    #error "_WIN32 is not defined! Windows APIs will fail."
-    #endif
-
+std::string QueryAiConversion(const std::string& history_context, 
+                              const std::string& kana, 
+                              const std::string& future_context, 
+                              const std::vector<std::string>& candidates) {
+    // Windows APIを使うため、パイプ名はそのまま使用
     static const char* kPipeName = "\\\\.\\pipe\\MozcBertPipe";
     
-    // データ作成: 文脈 TAB 読み TAB 候補1 TAB 候補2 ...
-    std::string payload = history_context + "\t" + kana;
+    // データ作成: 文脈 TAB 読み TAB 未来文脈 TAB 候補リスト...
+    std::string payload = history_context + "\t" + kana + "\t" + future_context;
     for (const auto& cand : candidates) {
         payload += "\t" + cand;
     }
@@ -582,8 +582,6 @@ bool Converter::ResizeSegments(Segments* segments,
 
 void Converter::ApplyConversion(Segments* segments,
                                 const ConversionRequest& request) const {
-  // DebugLog("[MozcAI] ApplyConversion called. Type: %d\n", request.request_type());
-
   // 1. まずMozc標準エンジンで全候補を出す
   if (!immutable_converter_->Convert(request, segments)) {
     MOZC_VLOG(1) << "Convert failed for key: " << segments->segment(0).key();
@@ -592,26 +590,36 @@ void Converter::ApplyConversion(Segments* segments,
   // 2. AIによるリランク処理（変換モード時のみ）
   if (request.request_type() == ConversionRequest::CONVERSION) {
     
-    std::string current_context = GetHistoryContext(*segments);
+    std::string current_history = GetHistoryContext(*segments);
+
+    // 文節数
+    size_t seg_size = segments->conversion_segments_size();
 
     // 文節ごとに処理
-    for (size_t i = 0; i < segments->conversion_segments_size(); ++i) {
+    for (size_t i = 0; i < seg_size; ++i) {
         Segment *seg = segments->mutable_conversion_segment(i);
         std::string key(seg->key().data(), seg->key().size());
 
-        // ★修正点：Mozcが出した候補リストを取得する
+        // ★未来文脈 (Future Context) の構築
+        // 現在の文節(i)より後ろにある全ての文節のキー(読み)を結合する
+        std::string future_context = "";
+        for (size_t j = i + 1; j < seg_size; ++j) {
+            const Segment &next_seg = segments->conversion_segment(j);
+            future_context += std::string(next_seg.key().data(), next_seg.key().size());
+        }
+
+        // Mozc候補リスト取得
         std::vector<std::string> candidate_list;
-        // 上位20件程度を送る（多すぎると通信エラーになるため制限）
         int limit = std::min((int)seg->candidates_size(), 20);
         for (int k = 0; k < limit; ++k) {
             candidate_list.push_back(seg->candidate(k).value);
         }
 
-        // 文脈 + 読み + 「候補リスト」をAIに投げる
-        std::string ai_result = QueryAiConversion(current_context, key, candidate_list);
+        // AIへ問い合わせ (未来文脈を含める)
+        std::string ai_result = QueryAiConversion(current_history, key, future_context, candidate_list);
 
         if (!ai_result.empty()) {
-            // AIが選んだ候補を先頭に挿入
+            // AIの結果を採用
             Candidate *cand = seg->push_back_candidate();
             cand->key = key;
             cand->content_key = key;
@@ -622,15 +630,17 @@ void Converter::ApplyConversion(Segments* segments,
             cand->lid = 0; 
             cand->rid = 0;
             
-            // 最優先に移動
+            // 最優先(先頭)に移動
             if (seg->candidates_size() > 1) {
                 seg->move_candidate(seg->candidates_size() - 1, 0);
             }
 
-            current_context += ai_result;
+            // 履歴更新：AIが選んだ単語を履歴として次へ渡す
+            current_history += ai_result;
         } else {
+            // AI失敗時などはMozcの1位を採用して履歴にする
             if (seg->candidates_size() > 0) {
-                current_context += seg->candidate(0).value;
+                current_history += seg->candidate(0).value;
             }
         }
     }
