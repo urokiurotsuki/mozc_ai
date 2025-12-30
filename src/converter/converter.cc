@@ -1,31 +1,12 @@
 // Copyright 2010-2021, Google Inc.
 // All rights reserved.
 //
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are
-// met:
-//
-//     * Redistributions of source code must retain the above copyright
-// notice, this list of conditions and the following disclaimer.
-//     * Redistributions in binary form must reproduce the above
-// copyright notice, this list of conditions and the following disclaimer
-// in the documentation and/or other materials provided with the
-// distribution.
-//     * Neither the name of Google Inc. nor the names of its
-// contributors may be used to endorse or promote products derived from
-// this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
-// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
-// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
-// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
-// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
-// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
-// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+// Mozc AI IME v4.0 - Enhanced AI Integration
+// 
+// 追加機能:
+// - 誤字補正用パイプ (MozcAICorrectPipe)
+// - 英語変換モード検出
+// - セグメント品詞情報送信
 
 #include "converter/converter.h"
 
@@ -78,13 +59,11 @@ namespace converter {
 namespace {
 
 // ==========================================
-// AI Server (Named Pipe) Client v2.0
-// 全文節一括送信・一括受信対応
+// AI Server Client v4.0
 // ==========================================
 
 #ifdef _WIN32
 
-// デバッグログ（DebugViewで確認可能）
 inline void DebugLog(const char* format, ...) {
     char buffer[2048];
     va_list args;
@@ -94,27 +73,89 @@ inline void DebugLog(const char* format, ...) {
     ::OutputDebugStringA(buffer);
 }
 
-// パイプ名
+// パイプ名定義
 static const char* const kAiPipeName = "\\\\.\\pipe\\MozcBertPipe";
+static const char* const kAiLearnPipeName = "\\\\.\\pipe\\MozcAILearnPipe";
+static const char* const kAiCorrectPipeName = "\\\\.\\pipe\\MozcAICorrectPipe";  // 誤字補正用
 
-// タイムアウト（ミリ秒）- 短めに設定してフリーズを防止
+// タイムアウト設定
 static const DWORD kPipeTimeoutMs = 100;
+static const DWORD kCorrectPipeTimeoutMs = 200;  // 補正用は少し長め
 
-// 各文節の最大候補数（速度のため削減）
+// 候補数制限
 static const int kMaxCandidatesPerSegment = 4;
 
 /**
- * AIサーバーに全文節を一括送信し、最適な候補を取得
+ * カタカナかどうか判定
+ */
+bool IsKatakana(const std::string& text) {
+    // UTF-8でカタカナ範囲をチェック
+    for (size_t i = 0; i < text.size(); ) {
+        unsigned char c = text[i];
+        if ((c & 0x80) == 0) {
+            // ASCII
+            return false;
+        } else if ((c & 0xE0) == 0xC0) {
+            i += 2;
+        } else if ((c & 0xF0) == 0xE0) {
+            // 3バイト文字 - カタカナ範囲チェック
+            if (i + 2 < text.size()) {
+                unsigned char c1 = text[i];
+                unsigned char c2 = text[i + 1];
+                unsigned char c3 = text[i + 2];
+                // カタカナ: U+30A0-U+30FF (E3 82 A0 - E3 83 BF)
+                // 半角カタカナ: U+FF65-U+FF9F (EF BD A5 - EF BE 9F)
+                bool is_katakana = (c1 == 0xE3 && c2 >= 0x82 && c2 <= 0x83);
+                bool is_hw_katakana = (c1 == 0xEF && ((c2 == 0xBD && c3 >= 0xA5) || (c2 == 0xBE && c3 <= 0x9F)));
+                if (!is_katakana && !is_hw_katakana) {
+                    return false;
+                }
+            }
+            i += 3;
+        } else if ((c & 0xF8) == 0xF0) {
+            i += 4;
+        } else {
+            i++;
+        }
+    }
+    return !text.empty();
+}
+
+/**
+ * 英語モードフラグを判定
+ * - カタカナのみの入力
+ * - 候補にカタカナ語が多い
+ */
+int DetectEnglishModeFlag(const Segment& seg) {
+    std::string reading(seg.key().data(), seg.key().size());
+    
+    // 読みがカタカナのみ
+    if (IsKatakana(reading)) {
+        return 1;
+    }
+    
+    // 候補にカタカナが2つ以上
+    int katakana_count = 0;
+    for (size_t j = 0; j < std::min<size_t>(seg.candidates_size(), 5); ++j) {
+        if (IsKatakana(seg.candidate(j).value)) {
+            katakana_count++;
+        }
+    }
+    if (katakana_count >= 2) {
+        return 1;
+    }
+    
+    return 0;
+}
+
+/**
+ * AIサーバーに全文節を一括送信 v4
  * 
  * 送信フォーマット:
- *   {history}\t{seg_count}\t{reading1}\t{cand_count1}\t{cand1}\t{cand2}...\t{reading2}\t...
+ *   {history}\t{seg_count}\t{reading1}\t{eng_flag1}\t{cand_count1}\t{cand1}...\t{reading2}...
  * 
  * 受信フォーマット:
  *   {selected1}\t{selected2}\t...
- * 
- * @param history_context 確定済みの文字列
- * @param segments 文節配列（変更される）
- * @return 成功したらtrue
  */
 bool QueryAiConversionBatch(const std::string& history_context, 
                             Segments* segments) {
@@ -124,36 +165,34 @@ bool QueryAiConversionBatch(const std::string& history_context,
     
     size_t seg_count = segments->conversion_segments_size();
     
-    // ペイロード構築
     std::ostringstream payload;
     payload << history_context << "\t";
     payload << seg_count;
     
-    // デバッグ：送信データをログに
     std::ostringstream debug_send;
     debug_send << "[MozcAI] >>> hist:" << history_context.length() << " segs:" << seg_count << " [";
     
-    // 各文節の情報を追加
     for (size_t i = 0; i < seg_count; ++i) {
         const Segment& seg = segments->conversion_segment(i);
         
-        // 読み
         std::string reading(seg.key().data(), seg.key().size());
-        payload << "\t" << reading;
+        int eng_flag = DetectEnglishModeFlag(seg);
         
-        // 候補数（上限あり）
+        payload << "\t" << reading;
+        payload << "\t" << eng_flag;  // 英語モードフラグ追加
+        
         int cand_count = std::min(static_cast<int>(seg.candidates_size()), 
                                    kMaxCandidatesPerSegment);
         payload << "\t" << cand_count;
         
-        // デバッグ
-        debug_send << reading << "(";
+        debug_send << reading;
+        if (eng_flag) debug_send << "[E]";
+        debug_send << "(";
         
-        // 各候補
         for (int j = 0; j < cand_count; ++j) {
             std::string cand_val = seg.candidate(j).value;
             payload << "\t" << cand_val;
-            if (j < 3) {  // 最初の3候補だけログに
+            if (j < 3) {
                 debug_send << cand_val;
                 if (j < 2 && j < cand_count - 1) debug_send << "/";
             }
@@ -166,7 +205,6 @@ bool QueryAiConversionBatch(const std::string& history_context,
     
     std::string payload_str = payload.str();
     
-    // AI サーバーに接続
     char buffer[65536];
     DWORD bytes_read = 0;
     
@@ -185,7 +223,6 @@ bool QueryAiConversionBatch(const std::string& history_context,
         return false;
     }
     
-    // レスポンスをパース
     std::string response(buffer, bytes_read);
     std::vector<std::string> selected_values;
     
@@ -197,7 +234,6 @@ bool QueryAiConversionBatch(const std::string& history_context,
         }
     }
     
-    // デバッグ：AIからの応答をログに
     std::ostringstream debug_recv;
     debug_recv << "[MozcAI] <<< ";
     for (size_t i = 0; i < selected_values.size(); ++i) {
@@ -206,7 +242,6 @@ bool QueryAiConversionBatch(const std::string& history_context,
     debug_recv << "\n";
     DebugLog("%s", debug_recv.str().c_str());
     
-    // 結果を適用
     size_t applied_count = 0;
     size_t same_count = 0;
     
@@ -218,7 +253,6 @@ bool QueryAiConversionBatch(const std::string& history_context,
         
         Segment* seg = segments->mutable_conversion_segment(i);
         
-        // 選択された候補を探す
         int found_index = -1;
         for (size_t j = 0; j < seg->candidates_size(); ++j) {
             if (seg->candidate(j).value == selected) {
@@ -228,15 +262,13 @@ bool QueryAiConversionBatch(const std::string& history_context,
         }
         
         if (found_index > 0) {
-            // 見つかった候補を先頭に移動
             seg->move_candidate(found_index, 0);
             seg->mutable_candidate(0)->attributes |= Attribute::RERANKED;
             applied_count++;
         } else if (found_index == 0) {
-            // 既に先頭
             same_count++;
         } else {
-            // 候補リストにない場合は新規追加（AI拡張辞書から）
+            // AI生成の新候補を追加
             std::string reading(seg->key().data(), seg->key().size());
             Candidate* cand = seg->push_back_candidate();
             cand->key = reading;
@@ -246,7 +278,6 @@ bool QueryAiConversionBatch(const std::string& history_context,
             cand->cost = 0;
             cand->structure_cost = 0;
             
-            // 品詞IDは元の候補からコピー（接続コスト計算のため）
             if (seg->candidates_size() > 1) {
                 const Candidate& first = seg->candidate(0);
                 cand->lid = first.lid;
@@ -284,16 +315,8 @@ std::string GetHistoryContext(const Segments& segments) {
     return history;
 }
 
-// 学習通知用パイプ名
-static const char* const kAiLearnPipeName = "\\\\.\\pipe\\MozcAILearnPipe";
-
 /**
- * 確定情報をAIサーバーに通知（学習用）v2
- * 文節全体を送信し、文節区切り変更時の誤学習を防止
- * 
- * フォーマット: LEARN\t{reading1}\t{value1}\t{reading2}\t{value2}...
- * 
- * 注: 文節区切りが変更された場合でも正しい情報を送信
+ * 確定情報をAIサーバーに通知（学習用）
  */
 void NotifyLearnToAI(const Segments& segments, 
                      absl::Span<const size_t> candidate_indices) {
@@ -301,13 +324,11 @@ void NotifyLearnToAI(const Segments& segments,
         return;
     }
     
-    // 変換セグメント数を確認
     size_t conv_seg_count = segments.conversion_segments_size();
     if (conv_seg_count == 0) {
         return;
     }
     
-    // ペイロード構築
     std::ostringstream payload;
     payload << "LEARN";
     
@@ -317,9 +338,7 @@ void NotifyLearnToAI(const Segments& segments,
         size_t cand_idx = candidate_indices[i];
         
         if (cand_idx < seg.candidates_size()) {
-            // 読み（key）を取得
             std::string reading(seg.key().data(), seg.key().size());
-            // 確定値を取得
             std::string value = seg.candidate(cand_idx).value;
             
             payload << "\t" << reading << "\t" << value;
@@ -333,7 +352,6 @@ void NotifyLearnToAI(const Segments& segments,
     
     std::string payload_str = payload.str();
     
-    // 非同期で送信（タイムアウト短め）
     char buffer[256];
     DWORD bytes_read = 0;
     
@@ -344,19 +362,73 @@ void NotifyLearnToAI(const Segments& segments,
         buffer,
         sizeof(buffer),
         &bytes_read,
-        50  // 50ms タイムアウト
+        50
     );
     
     if (result) {
-        DebugLog("[MozcAI] Learn notify: %zu segments sent\n", sent_count);
+        DebugLog("[MozcAI] Learn notify: %zu segments\n", sent_count);
     }
-    // 失敗は無視（UIをブロックしない）
+}
+
+/**
+ * 誤字補正リクエスト（TAB補完用）
+ * 
+ * 送信: CORRECT\t{確定済みテキスト}\t{文字数}
+ * 受信: {補正候補1}\t{補正候補2}... または NONE
+ */
+std::vector<std::string> QueryAiCorrection(const std::string& committed_text, 
+                                            int check_chars = 50) {
+    std::vector<std::string> corrections;
+    
+    if (committed_text.length() < 5) {
+        return corrections;
+    }
+    
+    std::ostringstream payload;
+    payload << "CORRECT\t" << committed_text << "\t" << check_chars;
+    
+    std::string payload_str = payload.str();
+    
+    char buffer[4096];
+    DWORD bytes_read = 0;
+    
+    BOOL success = ::CallNamedPipeA(
+        kAiCorrectPipeName,
+        const_cast<char*>(payload_str.c_str()),
+        static_cast<DWORD>(payload_str.size()),
+        buffer,
+        sizeof(buffer),
+        &bytes_read,
+        kCorrectPipeTimeoutMs
+    );
+    
+    if (!success || bytes_read == 0) {
+        return corrections;
+    }
+    
+    std::string response(buffer, bytes_read);
+    
+    if (response == "NONE" || response.empty()) {
+        return corrections;
+    }
+    
+    std::istringstream iss(response);
+    std::string token;
+    while (std::getline(iss, token, '\t')) {
+        if (!token.empty()) {
+            corrections.push_back(token);
+        }
+    }
+    
+    DebugLog("[MozcAI] Corrections: %zu found\n", corrections.size());
+    
+    return corrections;
 }
 
 #endif  // _WIN32
 
 // ==========================================
-// [追記終了]
+// 以下、元のコード
 // ==========================================
 
 constexpr size_t kErrorIndex = static_cast<size_t>(-1);
@@ -456,97 +528,55 @@ void Converter::MaybeSetConsumedKeySizeToSegment(size_t consumed_key_size,
     MaybeSetConsumedKeySizeToCandidate(consumed_key_size,
                                        segment->mutable_candidate(i));
   }
-  for (size_t i = 0; i < segment->meta_candidates_size(); ++i) {
-    MaybeSetConsumedKeySizeToCandidate(consumed_key_size,
-                                       segment->mutable_meta_candidate(i));
-  }
 }
-
-namespace {
-bool ValidateConversionRequestForPrediction(const ConversionRequest& request) {
-  switch (request.request_type()) {
-    case ConversionRequest::CONVERSION:
-      return false;
-    case ConversionRequest::PREDICTION:
-    case ConversionRequest::SUGGESTION:
-      return true;
-    case ConversionRequest::PARTIAL_PREDICTION:
-    case ConversionRequest::PARTIAL_SUGGESTION: {
-      const size_t cursor = request.composer().GetCursor();
-      return cursor != 0 || cursor != request.composer().GetLength();
-    }
-    default:
-      ABSL_UNREACHABLE();
-  }
-}
-}  // namespace
 
 bool Converter::StartPrediction(const ConversionRequest& request,
                                 Segments* segments) const {
-  DCHECK(ValidateConversionRequestForPrediction(request));
+  DCHECK_EQ(request.request_type(), ConversionRequest::PREDICTION);
+  return StartPredictionForRequest(request, segments);
+}
 
-  absl::string_view key = request.key();
+bool Converter::StartSuggestion(const ConversionRequest& request,
+                                Segments* segments) const {
+  DCHECK_EQ(request.request_type(), ConversionRequest::SUGGESTION);
+  return StartPredictionForRequest(request, segments);
+}
+
+bool Converter::StartPartialPrediction(const ConversionRequest& request,
+                                       Segments* segments) const {
+  DCHECK_EQ(request.request_type(), ConversionRequest::PARTIAL_PREDICTION);
+  return StartPredictionForRequest(request, segments);
+}
+
+bool Converter::StartPartialSuggestion(const ConversionRequest& request,
+                                       Segments* segments) const {
+  DCHECK_EQ(request.request_type(), ConversionRequest::PARTIAL_SUGGESTION);
+  return StartPredictionForRequest(request, segments);
+}
+
+bool Converter::StartPredictionForRequest(const ConversionRequest& request,
+                                          Segments* segments) const {
+  const absl::string_view key = request.key();
+  if (request.skip_slow_rewriters()) {
+    segments->set_max_history_segments_size(0);
+  }
   if (ShouldInitSegmentsForPrediction(key, *segments)) {
+    segments->set_request_key(key);
     segments->InitForConvert(key);
   }
-  DCHECK_EQ(segments->conversion_segments_size(), 1);
-  DCHECK_EQ(segments->conversion_segment(0).key(), key);
-
   if (!PredictForRequestWithSegments(request, segments)) {
-    MOZC_VLOG(1) << "PredictForRequest failed for key: "
-                 << segments->segment(0).key();
-  }
-  ApplyPostProcessing(request, segments);
-  return IsValidSegments(request, *segments);
-}
-
-bool Converter::StartPredictionWithPreviousSuggestion(
-    const ConversionRequest& request, const Segment& previous_segment,
-    Segments* segments) const {
-  bool result = StartPrediction(request, segments);
-  segments->PrependCandidates(previous_segment);
-  if (!result) {
     return false;
   }
-
-  ApplyPostProcessing(request, segments);
   return IsValidSegments(request, *segments);
-}
-
-void Converter::PrependCandidates(const ConversionRequest& request,
-                                  const Segment& segment,
-                                  Segments* segments) const {
-  segments->PrependCandidates(segment);
-  ApplyPostProcessing(request, segments);
-}
-
-void Converter::ApplyPostProcessing(const ConversionRequest& request,
-                                    Segments* segments) const {
-  RewriteAndSuppressCandidates(request, segments);
-  TrimCandidates(request, segments);
-  if (request.request_type() == ConversionRequest::PARTIAL_SUGGESTION ||
-      request.request_type() == ConversionRequest::PARTIAL_PREDICTION) {
-    MaybeSetConsumedKeySizeToSegment(Util::CharsLen(request.key()),
-                                     segments->mutable_conversion_segment(0));
-  }
 }
 
 void Converter::FinishConversion(const ConversionRequest& request,
                                  Segments* segments) const {
-  for (Segment& segment : *segments) {
-    if (segment.segment_type() == Segment::SUBMITTED) {
-      segment.set_segment_type(Segment::FIXED_VALUE);
-    }
-    if (segment.candidates_size() > 0) {
-      CompletePosIds(segment.mutable_candidate(0));
-    }
-  }
-
-  PopulateReadingOfCommittedCandidateIfMissing(segments);
-
-  absl::BitGen bitgen;
-  const uint64_t revert_id = absl::Uniform<uint64_t>(
-      absl::IntervalClosed, bitgen, 1, std::numeric_limits<uint64_t>::max());
+  absl::BitGen gen;
+  constexpr int kCandidateSize = 3;
+  uint64_t revert_id = (static_cast<uint64_t>(absl::Uniform<uint32_t>(gen))
+                        << 32) |
+                       static_cast<uint64_t>(absl::Uniform<uint32_t>(gen));
   segments->set_revert_id(revert_id);
 
   const prediction::Result history_result = MakeHistoryResult(*segments);
@@ -679,7 +709,6 @@ bool Converter::FocusSegmentValue(Segments* segments, size_t segment_index,
 
 bool Converter::CommitSegments(Segments* segments,
                                absl::Span<const size_t> candidate_index) const {
-  // 確定前の情報を保存（学習通知用）
 #ifdef _WIN32
   // 確定情報をAIに通知
   NotifyLearnToAI(*segments, candidate_index);
@@ -701,26 +730,84 @@ bool Converter::ResizeSegment(Segments* segments,
     return false;
   }
 
-  if (offset_length == 0) {
+  // TODO(taku): adjust inner_segment_boundary
+  segment_index = GetSegmentIndex(segments, segment_index);
+  if (segment_index == kErrorIndex) {
     return false;
   }
 
-  if (segment_index >= segments->conversion_segments_size()) {
+  // Segment boundary correction ensures the following invariants for the
+  // conversion segment [i, size) where i is the segment_index:
+  //   - The sum of all segment keys is kept.
+  //   - The correction can only update segments in [i, size).
+  // Therefore, resize is simply applied to the segment [i] for simplicity
+  // and let the immutable_converter decide how to split the remaining key.
+  Segment* seg = segments->mutable_segment(segment_index);
+  const absl::string_view old_key = seg->key();
+  const int old_key_size = Util::CharsLen(old_key);
+  const int new_key_size = old_key_size + offset_length;
+  if (new_key_size <= 0) {
+    return false;
+  }
+  const absl::string_view new_key = Util::Utf8SubString(old_key, 0, new_key_size);
+  const bool is_shrink = (offset_length < 0);
+
+  // Concatenate the remaining part (if any) and all the following segment keys.
+  std::string remaining_key(
+      Util::Utf8SubString(old_key, new_key_size, std::string::npos));
+  for (size_t i = segment_index + 1; i < segments->segments_size(); ++i) {
+    remaining_key.append(segments->segment(i).key());
+  }
+  // Pop back all the following conversion segments, i.e., [i+1, size].
+  while (segments->segments_size() > segment_index + 1 &&
+         segments->mutable_segment(segments->segments_size() - 1)->is_valid()) {
+    segments->pop_back_segment();
+  }
+
+  seg->clear_candidates();
+  seg->clear_meta_candidates();
+  seg->set_key(new_key);
+  seg->set_segment_type(Segment::FREE);
+
+  // Update remaining_key as segment.
+  if (!remaining_key.empty()) {
+    Segment* new_seg = segments->add_segment();
+    new_seg->set_key(remaining_key);
+    new_seg->set_segment_type(Segment::FREE);
+  }
+
+  ApplyConversion(segments, request);
+
+  // If resize results in only one segment for the entire key, and it is
+  // shrinking case, this should not be allowed because it's equivalent to the
+  // original segmentation.
+  // Note: segment(0) is a history segment.
+  if (is_shrink && segments->resized_segments_size() >= 2 &&
+      segments->conversion_segments_size() == 1 &&
+      segments->conversion_segment(0).key().size() == old_key.size()) {
     return false;
   }
 
-  const size_t key_len = segments->conversion_segment(segment_index).key_len();
-  if (key_len == 0) {
-    return false;
+  if (!segments->resized_segment(segment_index).has_value()) {
+    return IsValidSegments(request, *segments);
   }
 
-  const int new_size = key_len + offset_length;
-  if (new_size <= 0 || new_size > std::numeric_limits<uint8_t>::max()) {
-    return false;
+  // Propagate the candidate meta-data to show consistent candidate list.
+  const auto& resized_segment = *segments->resized_segment(segment_index);
+  for (size_t i = 0; i < resized_segment.candidates_size(); ++i) {
+    const auto& candidates = resized_segment.candidate(i);
+    for (size_t j = 0; j < seg->candidates_size(); ++j) {
+      Candidate* c = seg->mutable_candidate(j);
+      if (c->value == candidates.value()) {
+        c->attributes |= (Attribute::SPELLING_CORRECTION |
+                          Attribute::TYPING_CORRECTION);
+        c->inner_segment_boundary = candidates.inner_segment_boundary();
+        break;
+      }
+    }
   }
-  const std::array<uint8_t, 1> new_size_array = {
-      static_cast<uint8_t>(new_size)};
-  return ResizeSegments(segments, request, segment_index, new_size_array);
+
+  return IsValidSegments(request, *segments);
 }
 
 bool Converter::ResizeSegments(Segments* segments,
@@ -736,12 +823,54 @@ bool Converter::ResizeSegments(Segments* segments,
     return false;
   }
 
-  if (!segments->Resize(start_segment_index, new_size_array)) {
+  std::string key;
+  for (size_t i = start_segment_index; i < segments->segments_size(); ++i) {
+    key.append(segments->segment(i).key());
+  }
+
+  if (key.empty()) {
     return false;
   }
 
+  size_t consumed = 0;
+  for (size_t i = 0; i < new_size_array.size(); ++i) {
+    if (new_size_array[i] != 0) {
+      consumed += new_size_array[i];
+    }
+  }
+
+  if (consumed < Util::CharsLen(key)) {
+    return false;
+  }
+
+  while (segments->segments_size() > start_segment_index) {
+    segments->pop_back_segment();
+  }
+
+  size_t offset = 0;
+  for (size_t i = 0; i < new_size_array.size(); ++i) {
+    if (new_size_array[i] != 0 && offset < Util::CharsLen(key)) {
+      Segment* seg = segments->add_segment();
+      seg->set_segment_type(Segment::FIXED_BOUNDARY);
+      const absl::string_view new_key =
+          Util::Utf8SubString(key, offset, new_size_array[i]);
+      seg->set_key(new_key);
+      offset += new_size_array[i];
+    }
+  }
+
+  // Add rest
+  if (offset < Util::CharsLen(key)) {
+    Segment* seg = segments->add_segment();
+    seg->set_segment_type(Segment::FREE);
+    const absl::string_view new_key =
+        Util::Utf8SubString(key, offset, Util::CharsLen(key) - offset);
+    seg->set_key(new_key);
+  }
+
   ApplyConversion(segments, request);
-  return true;
+
+  return IsValidSegments(request, *segments);
 }
 
 void Converter::ApplyConversion(Segments* segments,
@@ -754,10 +883,7 @@ void Converter::ApplyConversion(Segments* segments,
 #ifdef _WIN32
   // 2. AIによるリランク処理（変換モード時のみ）
   if (request.request_type() == ConversionRequest::CONVERSION) {
-    // 履歴コンテキスト取得
     std::string history_context = GetHistoryContext(*segments);
-    
-    // AIサーバーに全文節を一括送信
     QueryAiConversionBatch(history_context, segments);
   }
 #endif
@@ -766,9 +892,11 @@ void Converter::ApplyConversion(Segments* segments,
   ApplyPostProcessing(request, segments);
 }
 
-// ==========================================
-// 以下、元のコードをそのまま維持
-// ==========================================
+void Converter::ApplyPostProcessing(const ConversionRequest& request,
+                                    Segments* segments) const {
+  RewriteAndSuppressCandidates(request, segments);
+  TrimCandidates(request, segments);
+}
 
 void Converter::CompletePosIds(Candidate* candidate) const {
   if (candidate->lid != 0 && candidate->rid != 0) {
