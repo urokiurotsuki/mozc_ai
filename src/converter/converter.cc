@@ -2,11 +2,37 @@
 // All rights reserved.
 //
 // Mozc AI IME v5.0 - Enhanced AI Integration
-// 
+//
 // 変更点 v5.0:
 // - FinishConversionに学習通知を追加（すべての確定フローに対応）
-// - NotifyLearnToAIFromSegments関数を追加
-// - CommitSegmentsの学習通知も維持（部分コミット用）
+// - StartConversionにAIリランキングを追加
+// - CommitSegmentsに学習通知を追加（部分コミット用）
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are
+// met:
+//
+//     * Redistributions of source code must retain the above copyright
+// notice, this list of conditions and the following disclaimer.
+//     * Redistributions in binary form must reproduce the above
+// copyright notice, this list of conditions and the following disclaimer
+// in the documentation and/or other materials provided with the
+// distribution.
+//     * Neither the name of Google Inc. nor the names of its
+// contributors may be used to endorse or promote products derived from
+// this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include "converter/converter.h"
 
@@ -21,10 +47,10 @@
 #include <tuple>
 #include <utility>
 #include <vector>
-#include <sstream>
 
 #ifdef _WIN32
 #include <windows.h>
+#include <sstream>
 #endif
 
 #include "absl/base/optimization.h"
@@ -76,12 +102,10 @@ inline void DebugLog(const char* format, ...) {
 // パイプ名定義
 static const char* const kAiPipeName = "\\\\.\\pipe\\MozcBertPipe";
 static const char* const kAiLearnPipeName = "\\\\.\\pipe\\MozcAILearnPipe";
-static const char* const kAiCorrectPipeName = "\\\\.\\pipe\\MozcAICorrectPipe";  // 誤字補正用
 
 // タイムアウト設定
 static const DWORD kPipeTimeoutMs = 100;
-static const DWORD kCorrectPipeTimeoutMs = 200;  // 補正用は少し長め
-static const DWORD kLearnPipeTimeoutMs = 50;     // 学習用は短め
+static const DWORD kLearnPipeTimeoutMs = 50;
 
 // 候補数制限
 static const int kMaxCandidatesPerSegment = 4;
@@ -90,22 +114,17 @@ static const int kMaxCandidatesPerSegment = 4;
  * カタカナかどうか判定
  */
 bool IsKatakana(const std::string& text) {
-    // UTF-8でカタカナ範囲をチェック
     for (size_t i = 0; i < text.size(); ) {
         unsigned char c = text[i];
         if ((c & 0x80) == 0) {
-            // ASCII
             return false;
         } else if ((c & 0xE0) == 0xC0) {
             i += 2;
         } else if ((c & 0xF0) == 0xE0) {
-            // 3バイト文字 - カタカナ範囲チェック
             if (i + 2 < text.size()) {
                 unsigned char c1 = text[i];
                 unsigned char c2 = text[i + 1];
                 unsigned char c3 = text[i + 2];
-                // カタカナ: U+30A0-U+30FF (E3 82 A0 - E3 83 BF)
-                // 半角カタカナ: U+FF65-U+FF9F (EF BD A5 - EF BE 9F)
                 bool is_katakana = (c1 == 0xE3 && c2 >= 0x82 && c2 <= 0x83);
                 bool is_hw_katakana = (c1 == 0xEF && ((c2 == 0xBD && c3 >= 0xA5) || (c2 == 0xBE && c3 <= 0x9F)));
                 if (!is_katakana && !is_hw_katakana) {
@@ -124,18 +143,14 @@ bool IsKatakana(const std::string& text) {
 
 /**
  * 英語モードフラグを判定
- * - カタカナのみの入力
- * - 候補にカタカナ語が多い
  */
 int DetectEnglishModeFlag(const Segment& seg) {
     std::string reading(seg.key().data(), seg.key().size());
     
-    // 読みがカタカナのみ
     if (IsKatakana(reading)) {
         return 1;
     }
     
-    // 候補にカタカナが2つ以上
     int katakana_count = 0;
     for (size_t j = 0; j < std::min<size_t>(seg.candidates_size(), 5); ++j) {
         if (IsKatakana(seg.candidate(j).value)) {
@@ -150,13 +165,21 @@ int DetectEnglishModeFlag(const Segment& seg) {
 }
 
 /**
- * AIサーバーに全文節を一括送信 v4
- * 
- * 送信フォーマット:
- *   {history}\t{seg_count}\t{reading1}\t{eng_flag1}\t{cand_count1}\t{cand1}...\t{reading2}...
- * 
- * 受信フォーマット:
- *   {selected1}\t{selected2}\t...
+ * 履歴コンテキストを取得
+ */
+std::string GetHistoryContext(const Segments& segments) {
+    std::string history;
+    for (size_t i = 0; i < segments.history_segments_size(); ++i) {
+        const Segment& seg = segments.history_segment(i);
+        if (seg.candidates_size() > 0) {
+            history += seg.candidate(0).value;
+        }
+    }
+    return history;
+}
+
+/**
+ * AIサーバーに全文節を一括送信してリランキング
  */
 bool QueryAiConversionBatch(const std::string& history_context, 
                             Segments* segments) {
@@ -180,7 +203,7 @@ bool QueryAiConversionBatch(const std::string& history_context,
         int eng_flag = DetectEnglishModeFlag(seg);
         
         payload << "\t" << reading;
-        payload << "\t" << eng_flag;  // 英語モードフラグ追加
+        payload << "\t" << eng_flag;
         
         int cand_count = std::min(static_cast<int>(seg.candidates_size()), 
                                    kMaxCandidatesPerSegment);
@@ -303,22 +326,7 @@ bool QueryAiConversionBatch(const std::string& history_context,
 }
 
 /**
- * 履歴コンテキストを取得
- */
-std::string GetHistoryContext(const Segments& segments) {
-    std::string history;
-    for (size_t i = 0; i < segments.history_segments_size(); ++i) {
-        const Segment& seg = segments.history_segment(i);
-        if (seg.candidates_size() > 0) {
-            history += seg.candidate(0).value;
-        }
-    }
-    return history;
-}
-
-/**
  * 確定情報をAIサーバーに通知（学習用） - CommitSegments用
- * candidate_indicesを使用してどの候補が確定されたかを判断
  */
 void NotifyLearnToAI(const Segments& segments, 
                      absl::Span<const size_t> candidate_indices) {
@@ -380,8 +388,6 @@ void NotifyLearnToAI(const Segments& segments,
  * 
  * v5.0新規追加:
  * この関数はFinishConversionから呼ばれ、すべての確定フローに対応します。
- * - Session::Commit() → EngineConverter::Commit() → FinishConversion()
- * - Session::CommitSuggestion() → EngineConverter::CommitSuggestionInternal() → FinishConversion()
  */
 void NotifyLearnToAIFromSegments(const Segments& segments) {
     size_t conv_seg_count = segments.conversion_segments_size();
@@ -401,7 +407,6 @@ void NotifyLearnToAIFromSegments(const Segments& segments) {
         
         if (seg.candidates_size() > 0) {
             std::string reading(seg.key().data(), seg.key().size());
-            // 最初の候補が確定されたもの
             std::string value = seg.candidate(0).value;
             
             payload << "\t" << reading << "\t" << value;
@@ -438,70 +443,13 @@ void NotifyLearnToAIFromSegments(const Segments& segments) {
     }
 }
 
-/**
- * 誤字補正リクエスト（TAB補完用）
- * 
- * 送信: CORRECT\t{確定済みテキスト}\t{文字数}
- * 受信: {補正候補1}\t{補正候補2}... または NONE
- */
-std::vector<std::string> QueryAiCorrection(const std::string& committed_text, 
-                                            int check_chars = 50) {
-    std::vector<std::string> corrections;
-    
-    if (committed_text.length() < 5) {
-        return corrections;
-    }
-    
-    std::ostringstream payload;
-    payload << "CORRECT\t" << committed_text << "\t" << check_chars;
-    
-    std::string payload_str = payload.str();
-    
-    char buffer[4096];
-    DWORD bytes_read = 0;
-    
-    BOOL success = ::CallNamedPipeA(
-        kAiCorrectPipeName,
-        const_cast<char*>(payload_str.c_str()),
-        static_cast<DWORD>(payload_str.size()),
-        buffer,
-        sizeof(buffer),
-        &bytes_read,
-        kCorrectPipeTimeoutMs
-    );
-    
-    if (!success || bytes_read == 0) {
-        return corrections;
-    }
-    
-    std::string response(buffer, bytes_read);
-    if (response == "NONE" || response.empty()) {
-        return corrections;
-    }
-    
-    std::istringstream iss(response);
-    std::string token;
-    while (std::getline(iss, token, '\t')) {
-        if (!token.empty()) {
-            corrections.push_back(token);
-        }
-    }
-    
-    return corrections;
-}
-
 #else
-
 // Non-Windows stubs
 inline void DebugLog(const char* format, ...) {}
-bool QueryAiConversionBatch(const std::string& history_context, Segments* segments) { return false; }
 std::string GetHistoryContext(const Segments& segments) { return ""; }
+bool QueryAiConversionBatch(const std::string& history_context, Segments* segments) { return false; }
 void NotifyLearnToAI(const Segments& segments, absl::Span<const size_t> candidate_indices) {}
 void NotifyLearnToAIFromSegments(const Segments& segments) {}
-std::vector<std::string> QueryAiCorrection(const std::string& committed_text, int check_chars = 50) { 
-    return std::vector<std::string>(); 
-}
-
 #endif
 
 // ==========================================
@@ -519,44 +467,25 @@ size_t GetSegmentIndex(const Segments* segments, size_t segment_index) {
   return result;
 }
 
-void SetKey(Segments* segments, const absl::string_view key) {
-  segments->set_max_history_segments_size(4);
-  segments->clear_conversion_segments();
-  segments->set_resized(false);
-  Segment* seg = segments->add_segment();
-  DCHECK(seg);
-  seg->set_key(key);
-  seg->set_segment_type(Segment::FREE);
-}
-
-bool ShouldSetKeyForPrediction(const ConversionRequest& request,
-                               const Segments& segments) {
-  // If the segments is for conversion or already has some results,
-  // the new key should not be set to keep the current state.
-  // NOTE:
-  // 1. Not resized
-  //    Following the first condition, segments may be CONVERSION_SEGMENTS_SIZE
-  //    > 1 if the last segment is very long and the Converter tries to resplit
-  //    it. In this case, the old key should be kept, because it's not
-  //    triggered by a user, rather it's triggered by Predictor.
-  // 2. Not submitted
-  //    After committing a segment, the converter generates next segments
-  //    for the rest of the composition. We should keep them until a new
-  //    key is set. Note if the next segment is generated, segments has some
-  //    conversion result.
-  return !segments.resized() &&
-         (segments.conversion_segments_size() == 0 ||
-          segments.conversion_segment(0).candidates_size() == 0);
+bool ShouldInitSegmentsForPrediction(absl::string_view key,
+                                     const Segments& segments) {
+  return segments.conversion_segments_size() == 0 ||
+         segments.conversion_segment(0).key() != key;
 }
 
 bool IsValidSegments(const ConversionRequest& request,
                      const Segments& segments) {
-  // All segments should have at least one candidate.  Otherwise prediction
-  // results may get dropped.
-  for (const Segment& segment : segments.conversion_segments()) {
-    if (segment.candidates_size() == 0) {
-      return false;
+  const bool is_mobile = request.request().zero_query_suggestion() &&
+                         request.request().mixed_conversion();
+
+  for (const Segment& segment : segments) {
+    if (segment.candidates_size() != 0) {
+      continue;
     }
+    if (is_mobile && segment.meta_candidates_size() != 0) {
+      continue;
+    }
+    return false;
   }
   return true;
 }
@@ -570,80 +499,139 @@ Converter::Converter(
     const RewriterFactory& rewriter_factory)
     : modules_(std::move(modules)),
       immutable_converter_(immutable_converter_factory(*modules_)),
-      predictor_(predictor_factory(*modules_, *this, *immutable_converter_)),
-      rewriter_(rewriter_factory(*modules_)),
-      pos_matcher_(*modules_->GetPosMatcher()),
-      user_dictionary_(*modules_->GetUserDictionary()),
-      history_reconstructor_(*modules_->GetPosMatcher()),
-      reverse_converter_(*modules_->GetDictionary(), *modules_->GetPosMatcher()),
-      general_noun_id_(modules_->GetPosMatcher()->GetGeneralNounId()) {}
+      pos_matcher_(modules_->GetPosMatcher()),
+      user_dictionary_(modules_->GetUserDictionary()),
+      history_reconstructor_(modules_->GetPosMatcher()),
+      reverse_converter_(*immutable_converter_),
+      general_noun_id_(pos_matcher_.GetGeneralNounId()) {
+  DCHECK(immutable_converter_);
+  predictor_ = predictor_factory(*modules_, *this, *immutable_converter_);
+  rewriter_ = rewriter_factory(*modules_);
+  DCHECK(predictor_);
+  DCHECK(rewriter_);
+}
 
 bool Converter::StartConversion(const ConversionRequest& request,
                                 Segments* segments) const {
-  SetKey(segments, request.key());
+  DCHECK_EQ(request.request_type(), ConversionRequest::CONVERSION);
+
+  absl::string_view key = request.key();
+  if (key.empty()) {
+    return false;
+  }
+
+  segments->InitForConvert(key);
   ApplyConversion(segments, request);
-  
+
 #ifdef _WIN32
   // Apply AI reranking
   std::string history = GetHistoryContext(*segments);
   QueryAiConversionBatch(history, segments);
 #endif
-  
+
   return IsValidSegments(request, *segments);
 }
 
 bool Converter::StartReverseConversion(Segments* segments,
                                        const absl::string_view key) const {
+  segments->Clear();
+  if (key.empty()) {
+    return false;
+  }
+  segments->InitForConvert(key);
+
   return reverse_converter_.ReverseConvert(key, segments);
 }
 
+// static
+void Converter::MaybeSetConsumedKeySizeToCandidate(size_t consumed_key_size,
+                                                   Candidate* candidate) {
+  if (candidate->attributes & Attribute::PARTIALLY_KEY_CONSUMED) {
+    return;
+  }
+  candidate->attributes |= Attribute::PARTIALLY_KEY_CONSUMED;
+  candidate->consumed_key_size = consumed_key_size;
+}
+
+// static
+void Converter::MaybeSetConsumedKeySizeToSegment(size_t consumed_key_size,
+                                                 Segment* segment) {
+  for (size_t i = 0; i < segment->candidates_size(); ++i) {
+    MaybeSetConsumedKeySizeToCandidate(consumed_key_size,
+                                       segment->mutable_candidate(i));
+  }
+  for (size_t i = 0; i < segment->meta_candidates_size(); ++i) {
+    MaybeSetConsumedKeySizeToCandidate(consumed_key_size,
+                                       segment->mutable_meta_candidate(i));
+  }
+}
+
+namespace {
+bool ValidateConversionRequestForPrediction(const ConversionRequest& request) {
+  switch (request.request_type()) {
+    case ConversionRequest::CONVERSION:
+      return false;
+    case ConversionRequest::PREDICTION:
+    case ConversionRequest::SUGGESTION:
+      return true;
+    case ConversionRequest::PARTIAL_PREDICTION:
+    case ConversionRequest::PARTIAL_SUGGESTION: {
+      const size_t cursor = request.composer().GetCursor();
+      return cursor != 0 || cursor != request.composer().GetLength();
+    }
+    default:
+      ABSL_UNREACHABLE();
+  }
+}
+}  // namespace
+
 bool Converter::StartPrediction(const ConversionRequest& request,
                                 Segments* segments) const {
-  DCHECK(segments);
-  if (ShouldSetKeyForPrediction(request, *segments)) {
-    SetKey(segments, request.key());
+  DCHECK(ValidateConversionRequestForPrediction(request));
+
+  absl::string_view key = request.key();
+  if (ShouldInitSegmentsForPrediction(key, *segments)) {
+    segments->InitForConvert(key);
   }
-  return PredictForRequestWithSegments(request, segments);
+  DCHECK_EQ(segments->conversion_segments_size(), 1);
+  DCHECK_EQ(segments->conversion_segment(0).key(), key);
+
+  if (!PredictForRequestWithSegments(request, segments)) {
+    MOZC_VLOG(1) << "PredictForRequest failed for key: "
+                 << segments->segment(0).key();
+  }
+  ApplyPostProcessing(request, segments);
+  return IsValidSegments(request, *segments);
 }
 
 bool Converter::StartPredictionWithPreviousSuggestion(
     const ConversionRequest& request, const Segment& previous_segment,
     Segments* segments) const {
-  DCHECK(segments);
-  if (ShouldSetKeyForPrediction(request, *segments)) {
-    SetKey(segments, request.key());
+  bool result = StartPrediction(request, segments);
+  segments->PrependCandidates(previous_segment);
+  if (!result) {
+    return false;
   }
-  PrependCandidates(request, previous_segment, segments);
-  return PredictForRequestWithSegments(request, segments);
+
+  ApplyPostProcessing(request, segments);
+  return IsValidSegments(request, *segments);
 }
 
 void Converter::PrependCandidates(const ConversionRequest& request,
-                                  const Segment& previous_segment,
+                                  const Segment& segment,
                                   Segments* segments) const {
-  // This function just prepends all previous candidates in order.
-  if (segments->conversion_segments_size() == 0) {
-    Segment* segment = segments->add_segment();
-    segment->set_segment_type(Segment::FREE);
-    segment->set_key(request.key());
-  }
-  auto* segment = segments->mutable_conversion_segment(0);
-  for (auto iter = previous_segment.candidates().rbegin();
-       iter != previous_segment.candidates().rend(); ++iter) {
-    // Move this candidate to the top.
-    // Instead of directly prepending a new candidate by calling
-    // segment->insert_candidate(0), first look for the duplicate candidate from
-    // the existing candidates.  If found, move its index to the top.
-    bool found = false;
-    for (size_t i = 0; i < segment->candidates_size(); ++i) {
-      if (iter->value == segment->candidate(i).value) {
-        segment->move_candidate(i, 0);
-        found = true;
-        break;
-      }
-    }
-    if (!found) {
-      segment->insert_candidate(0, *iter);
-    }
+  segments->PrependCandidates(segment);
+  ApplyPostProcessing(request, segments);
+}
+
+void Converter::ApplyPostProcessing(const ConversionRequest& request,
+                                    Segments* segments) const {
+  RewriteAndSuppressCandidates(request, segments);
+  TrimCandidates(request, segments);
+  if (request.request_type() == ConversionRequest::PARTIAL_SUGGESTION ||
+      request.request_type() == ConversionRequest::PARTIAL_PREDICTION) {
+    MaybeSetConsumedKeySizeToSegment(Util::CharsLen(request.key()),
+                                     segments->mutable_conversion_segment(0));
   }
 }
 
@@ -652,17 +640,24 @@ void Converter::FinishConversion(const ConversionRequest& request,
                                  Segments* segments) const {
 #ifdef _WIN32
   // 確定情報をAIに通知（学習用）
-  // この通知はすべての確定フローで呼ばれます：
-  // - EngineConverter::Commit() → FinishConversion()
-  // - EngineConverter::CommitSuggestionInternal() → FinishConversion()
+  // この通知はすべての確定フローで呼ばれます
   NotifyLearnToAIFromSegments(*segments);
 #endif
 
-  absl::BitGen gen;
-  constexpr int kCandidateSize = 3;
-  uint64_t revert_id = (static_cast<uint64_t>(absl::Uniform<uint32_t>(gen))
-                        << 32) |
-                       static_cast<uint64_t>(absl::Uniform<uint32_t>(gen));
+  for (Segment& segment : *segments) {
+    if (segment.segment_type() == Segment::SUBMITTED) {
+      segment.set_segment_type(Segment::FIXED_VALUE);
+    }
+    if (segment.candidates_size() > 0) {
+      CompletePosIds(segment.mutable_candidate(0));
+    }
+  }
+
+  PopulateReadingOfCommittedCandidateIfMissing(segments);
+
+  absl::BitGen bitgen;
+  const uint64_t revert_id = absl::Uniform<uint64_t>(
+      absl::IntervalClosed, bitgen, 1, std::numeric_limits<uint64_t>::max());
   segments->set_revert_id(revert_id);
 
   const prediction::Result history_result = MakeHistoryResult(*segments);
@@ -744,36 +739,14 @@ bool Converter::CommitSegmentValueInternal(
     return false;
   }
 
-  if (candidate_index >= 0 && candidate_index < values_size) {
-    segment->move_candidate(candidate_index, 0);
-  } else if (candidate_index < 0) {
-    segment->set_segment_type(segment_type);
-    return true;
-  }
-
   segment->set_segment_type(segment_type);
-  MaybeSetConsumedKeySizeToSegment(Util::CharsLen(segment->candidate(0).key),
-                                   segment);
-  CompletePosIds(segment->mutable_candidate(0));
+  segment->move_candidate(candidate_index, 0);
+
+  if (candidate_index != 0) {
+    segment->mutable_candidate(0)->attributes |= Attribute::RERANKED;
+  }
+
   return true;
-}
-
-// static
-void Converter::MaybeSetConsumedKeySizeToCandidate(size_t consumed_key_size,
-                                                   Candidate* candidate) {
-  if (candidate->attributes & Attribute::PARTIALLY_KEY_CONSUMED) {
-    return;
-  }
-  candidate->attributes |= Attribute::PARTIALLY_KEY_CONSUMED;
-  candidate->consumed_key_size = consumed_key_size;
-}
-
-// static
-void Converter::MaybeSetConsumedKeySizeToSegment(size_t consumed_key_size,
-                                                 Segment* segment) {
-  for (Candidate& candidate : *segment->mutable_candidates()) {
-    MaybeSetConsumedKeySizeToCandidate(consumed_key_size, &candidate);
-  }
 }
 
 bool Converter::CommitSegmentValue(Segments* segments, size_t segment_index,
@@ -815,11 +788,11 @@ bool Converter::FocusSegmentValue(Segments* segments, size_t segment_index,
   return rewriter_->Focus(segments, segment_index, candidate_index);
 }
 
+// v5.0: CommitSegmentsに学習通知を追加（部分コミット用）
 bool Converter::CommitSegments(Segments* segments,
                                absl::Span<const size_t> candidate_index) const {
 #ifdef _WIN32
   // 確定情報をAIに通知（部分コミット用）
-  // この関数はCommitSegmentsInternal経由で呼ばれる（CommitFirstSegment, CommitHeadToFocusedSegments）
   NotifyLearnToAI(*segments, candidate_index);
 #endif
 
@@ -839,65 +812,26 @@ bool Converter::ResizeSegment(Segments* segments,
     return false;
   }
 
-  // TODO(taku): adjust inner_segment_boundary
-  segment_index = GetSegmentIndex(segments, segment_index);
-  if (segment_index == kErrorIndex) {
+  if (offset_length == 0) {
     return false;
   }
 
-  // Segment boundary correction ensures the following invariants for the
-  // conversion segment [i, size) where i is the segment_index:
-  //   - The sum of all segment keys is kept.
-  //   - The correction can only update segments in [i, size).
-  // Therefore, resize is simply applied to the segment [i] for simplicity
-  // and let the immutable_converter decide how to split the remaining key.
-  Segment* seg = segments->mutable_segment(segment_index);
-  const absl::string_view old_key = seg->key();
-  const int old_key_size = Util::CharsLen(old_key);
-  const int new_key_size = old_key_size + offset_length;
-  if (new_key_size <= 0) {
+  if (segment_index >= segments->conversion_segments_size()) {
     return false;
   }
-  const absl::string_view new_key = Util::Utf8SubString(old_key, 0, new_key_size);
-  const bool is_shrink = (offset_length < 0);
 
-  // Concatenate the remaining part (if any) and all the following segment keys.
-  std::string remaining_key(
-      Util::Utf8SubString(old_key, new_key_size, std::string::npos));
-  for (size_t i = segment_index + 1; i < segments->segments_size(); ++i) {
-    remaining_key.append(segments->segment(i).key());
-  }
-  // Pop back all the following conversion segments, i.e., [i+1, size].
-  while (segments->segments_size() > segment_index + 1 &&
-         segments->mutable_segment(segments->segments_size() - 1)->is_valid()) {
-    segments->pop_back_segment();
+  const size_t key_len = segments->conversion_segment(segment_index).key_len();
+  if (key_len == 0) {
+    return false;
   }
 
-  seg->clear_candidates();
-  seg->clear_meta_candidates();
-  seg->set_key(new_key);
-  seg->set_segment_type(Segment::FREE);
-
-  // Update remaining_key as segment.
-  if (!remaining_key.empty()) {
-    Segment* new_seg = segments->add_segment();
-    new_seg->set_key(remaining_key);
-    new_seg->set_segment_type(Segment::FREE);
+  const int new_size = key_len + offset_length;
+  if (new_size <= 0 || new_size > std::numeric_limits<uint8_t>::max()) {
+    return false;
   }
-
-  ApplyConversion(segments, request);
-
-  if (is_shrink) {
-    // Move the shrunken segment while fixing.
-    seg = segments->mutable_segment(segment_index);
-    for (Candidate& candidate : *seg->mutable_candidates()) {
-      MaybeSetConsumedKeySizeToCandidate(Util::CharsLen(new_key), &candidate);
-    }
-  }
-
-  segments->set_resized(true);
-
-  return true;
+  const std::array<uint8_t, 1> new_size_array = {
+      static_cast<uint8_t>(new_size)};
+  return ResizeSegments(segments, request, segment_index, new_size_array);
 }
 
 bool Converter::ResizeSegments(Segments* segments,
@@ -908,106 +842,121 @@ bool Converter::ResizeSegments(Segments* segments,
     return false;
   }
 
-  // TODO(taku): adjust inner_segment_boundary
-
   start_segment_index = GetSegmentIndex(segments, start_segment_index);
   if (start_segment_index == kErrorIndex) {
     return false;
   }
 
-  // This is the simplified resizing: first concatenate all keys of segments in
-  // [start_segment_index, segments_size), and then resplit the keys using
-  // new_size_array.
-  std::string concatenated_key;
-  for (size_t i = start_segment_index; i < segments->segments_size(); ++i) {
-    concatenated_key.append(segments->segment(i).key());
-  }
-  size_t sum = 0;
-  for (const uint8_t n : new_size_array) {
-    sum += n;
-  }
-  if (sum != Util::CharsLen(concatenated_key)) {
+  if (!segments->Resize(start_segment_index, new_size_array)) {
     return false;
   }
 
-  // Pop back all the segments in [start_segment_index, segments_size).
-  while (segments->segments_size() > start_segment_index) {
-    segments->pop_back_segment();
-  }
-
-  // Create new segments using new_size_array.
-  size_t pos = 0;
-  for (const uint8_t new_size : new_size_array) {
-    Segment* seg = segments->add_segment();
-    seg->set_key(Util::Utf8SubString(concatenated_key, pos, new_size));
-    seg->set_segment_type(Segment::FREE);
-    pos += new_size;
-  }
-
   ApplyConversion(segments, request);
-
-  // Partially consumed key information is added to each candidate in the
-  // segments as they are considered resized by user.
-  for (size_t i = start_segment_index; i < segments->segments_size(); ++i) {
-    MaybeSetConsumedKeySizeToSegment(Util::CharsLen(segments->segment(i).key()),
-                                     segments->mutable_segment(i));
-  }
-
-  segments->set_resized(true);
-
   return true;
 }
 
 void Converter::ApplyConversion(Segments* segments,
                                 const ConversionRequest& request) const {
-  if (!immutable_converter_->ConvertForRequest(request, segments)) {
-    return;
+  if (!immutable_converter_->Convert(request, segments)) {
+    MOZC_VLOG(1) << "Convert failed for key: " << segments->segment(0).key();
   }
+
   ApplyPostProcessing(request, segments);
 }
 
-void Converter::ApplyPostProcessing(const ConversionRequest& request,
-                                    Segments* segments) const {
-  RewriteAndSuppressCandidates(request, segments);
-  TrimCandidates(request, segments);
-}
-
 void Converter::CompletePosIds(Candidate* candidate) const {
+  DCHECK(candidate);
+  if (candidate->value.empty() || candidate->key.empty()) {
+    return;
+  }
+
   if (candidate->lid != 0 && candidate->rid != 0) {
     return;
   }
-  if (candidate->lid == 0 && candidate->rid != 0) {
-    candidate->lid = candidate->rid;
-  } else if (candidate->lid != 0 && candidate->rid == 0) {
-    candidate->rid = candidate->lid;
-  } else {
-    candidate->lid = general_noun_id_;
-    candidate->rid = general_noun_id_;
+
+  candidate->lid = general_noun_id_;
+  candidate->rid = general_noun_id_;
+  constexpr size_t kExpandSizeStart = 5;
+  constexpr size_t kExpandSizeDiff = 50;
+  constexpr size_t kExpandSizeMax = 80;
+  for (size_t size = kExpandSizeStart; size < kExpandSizeMax;
+       size += kExpandSizeDiff) {
+    Segments segments;
+    segments.InitForConvert(candidate->key);
+    const ConversionRequest request =
+        ConversionRequestBuilder()
+            .SetOptions({
+                .request_type = ConversionRequest::PREDICTION,
+                .max_conversion_candidates_size = static_cast<int>(size),
+            })
+            .Build();
+    if (!immutable_converter_->Convert(request, &segments)) {
+      LOG(ERROR) << "ImmutableConverter::Convert() failed";
+      return;
+    }
+    for (size_t i = 0; i < segments.segment(0).candidates_size(); ++i) {
+      const Candidate& ref_candidate = segments.segment(0).candidate(i);
+      if (ref_candidate.value == candidate->value) {
+        candidate->lid = ref_candidate.lid;
+        candidate->rid = ref_candidate.rid;
+        candidate->cost = ref_candidate.cost;
+        candidate->wcost = ref_candidate.wcost;
+        candidate->structure_cost = ref_candidate.structure_cost;
+        MOZC_VLOG(1) << "Set LID: " << candidate->lid;
+        MOZC_VLOG(1) << "Set RID: " << candidate->rid;
+        return;
+      }
+    }
   }
+  MOZC_DVLOG(2) << "Cannot set lid/rid. use default value. "
+                << "key: " << candidate->key << ", "
+                << "value: " << candidate->value << ", "
+                << "lid: " << candidate->lid << ", "
+                << "rid: " << candidate->rid;
 }
 
 void Converter::RewriteAndSuppressCandidates(const ConversionRequest& request,
                                              Segments* segments) const {
-  if (request.skip_slow_rewriters()) {
+  if (std::optional<RewriterInterface::ResizeSegmentsRequest> resize_request =
+          rewriter_->CheckResizeSegmentsRequest(request, *segments);
+      resize_request.has_value()) {
+    if (ResizeSegments(segments, request, resize_request->segment_index,
+                       resize_request->segment_sizes)) {
+      return;
+    }
+  }
+
+  if (!rewriter_->Rewrite(request, segments)) {
     return;
   }
-  const prediction::Result history_result = MakeHistoryResult(*segments);
-  const ConversionRequest rewriter_req =
-      ConversionRequestBuilder()
-          .SetConversionRequestView(request)
-          .SetHistoryResultView(history_result)
-          .Build();
-  rewriter_->Rewrite(rewriter_req, segments);
+
+  if (!user_dictionary_.HasSuppressedEntries()) {
+    return;
+  }
+  for (Segment& segment : segments->conversion_segments()) {
+    for (size_t j = 0; j < segment.candidates_size();) {
+      const Candidate& cand = segment.candidate(j);
+      if (user_dictionary_.IsSuppressedEntry(cand.key, cand.value)) {
+        segment.erase_candidate(j);
+      } else {
+        ++j;
+      }
+    }
+  }
 }
 
 void Converter::TrimCandidates(const ConversionRequest& request,
                                Segments* segments) const {
-  const size_t candidates_limit = request.max_conversion_candidates_size();
-  if (candidates_limit == 0) {
+  const mozc::commands::Request& request_proto = request.request();
+  if (!request_proto.has_candidates_size_limit()) {
     return;
   }
+
+  const int limit = request_proto.candidates_size_limit();
   for (Segment& segment : segments->conversion_segments()) {
-    const size_t candidates_size = segment.candidates_size();
+    const int candidates_size = segment.candidates_size();
+    const int candidates_limit =
+        std::max<int>(1, limit - segment.meta_candidates_size());
     if (candidates_size < candidates_limit) {
       continue;
     }
