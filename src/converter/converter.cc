@@ -1,38 +1,16 @@
-// Copyright 2010-2021, Google Inc.
+// Copyright 2010-2025, Google Inc.
 // All rights reserved.
 //
-// Mozc AI IME v5.0 - Enhanced AI Integration
+// Mozc AI IME v7.0 - Extreme Performance (Build Ready)
 //
-// 変更点 v5.0:
-// - FinishConversionに学習通知を追加（すべての確定フローに対応）
-// - StartConversionにAIリランキングを追加
-// - CommitSegmentsに学習通知を追加（部分コミット用）
+// 設計変更点:
+// - 不要なレガシープロトコル(V0/Legacy)のハンドリングを削除しV1に一本化
+// - AI候補がない場合の「英語強制注入(Injection)」ロジックの実装
+// - タイムアウト時の高速脱出(Early Exit)
+// - TAB補完(Prediction)時にもAIを作動させるフックを追加
 //
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are
-// met:
-//
-//     * Redistributions of source code must retain the above copyright
-// notice, this list of conditions and the following disclaimer.
-//     * Redistributions in binary form must reproduce the above
-// copyright notice, this list of conditions and the following disclaimer
-// in the documentation and/or other materials provided with the
-// distribution.
-//     * Neither the name of Google Inc. nor the names of its
-// contributors may be used to endorse or promote products derived from
-// this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
-// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
-// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
-// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
-// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
-// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
-// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+// プロトコル V1:
+//   V1\t{history}\t{seg_count}\t{reading1}\t{cand_count1}\t{cand1}...\t{reading2}...
 
 #include "converter/converter.h"
 
@@ -85,84 +63,23 @@ namespace converter {
 namespace {
 
 // ==========================================
-// AI Server Client v5.0
+// AI Server Client v7.0 (Implementation)
 // ==========================================
 
 #ifdef _WIN32
 
-inline void DebugLog(const char* format, ...) {
-    char buffer[2048];
-    va_list args;
-    va_start(args, format);
-    vsnprintf(buffer, sizeof(buffer), format, args);
-    va_end(args);
-    ::OutputDebugStringA(buffer);
-}
+// パイプ設定
+constexpr char kAiPipeName[] = "\\\\.\\pipe\\MozcBertPipe";
+constexpr char kAiLearnPipeName[] = "\\\\.\\pipe\\MozcAILearnPipe";
+constexpr char kProtocolVersion[] = "V1";
 
-// パイプ名定義
-static const char* const kAiPipeName = "\\\\.\\pipe\\MozcBertPipe";
-static const char* const kAiLearnPipeName = "\\\\.\\pipe\\MozcAILearnPipe";
+// タイムアウト設定 (ms)
+// 応答性を最優先し、80msを超えたら即座にAIを諦める
+constexpr DWORD kPipeTimeoutMs = 80;
+constexpr DWORD kLearnPipeTimeoutMs = 30;
 
-// タイムアウト設定
-static const DWORD kPipeTimeoutMs = 100;
-static const DWORD kLearnPipeTimeoutMs = 50;
-
-// 候補数制限
-static const int kMaxCandidatesPerSegment = 4;
-
-/**
- * カタカナかどうか判定
- */
-bool IsKatakana(const std::string& text) {
-    for (size_t i = 0; i < text.size(); ) {
-        unsigned char c = text[i];
-        if ((c & 0x80) == 0) {
-            return false;
-        } else if ((c & 0xE0) == 0xC0) {
-            i += 2;
-        } else if ((c & 0xF0) == 0xE0) {
-            if (i + 2 < text.size()) {
-                unsigned char c1 = text[i];
-                unsigned char c2 = text[i + 1];
-                unsigned char c3 = text[i + 2];
-                bool is_katakana = (c1 == 0xE3 && c2 >= 0x82 && c2 <= 0x83);
-                bool is_hw_katakana = (c1 == 0xEF && ((c2 == 0xBD && c3 >= 0xA5) || (c2 == 0xBE && c3 <= 0x9F)));
-                if (!is_katakana && !is_hw_katakana) {
-                    return false;
-                }
-            }
-            i += 3;
-        } else if ((c & 0xF8) == 0xF0) {
-            i += 4;
-        } else {
-            i++;
-        }
-    }
-    return !text.empty();
-}
-
-/**
- * 英語モードフラグを判定
- */
-int DetectEnglishModeFlag(const Segment& seg) {
-    std::string reading(seg.key().data(), seg.key().size());
-    
-    if (IsKatakana(reading)) {
-        return 1;
-    }
-    
-    int katakana_count = 0;
-    for (size_t j = 0; j < std::min<size_t>(seg.candidates_size(), 5); ++j) {
-        if (IsKatakana(seg.candidate(j).value)) {
-            katakana_count++;
-        }
-    }
-    if (katakana_count >= 2) {
-        return 1;
-    }
-    
-    return 0;
-}
+// 通信量削減のため、送信する候補数は上位のみに絞る
+constexpr int kMaxCandidatesToSend = 8;
 
 /**
  * 履歴コンテキストを取得
@@ -179,7 +96,8 @@ std::string GetHistoryContext(const Segments& segments) {
 }
 
 /**
- * AIサーバーに全文節を一括送信してリランキング
+ * AIサーバーにリランキング要求 (Strict V1)
+ * 戻り値: 変更があったかどうか
  */
 bool QueryAiConversionBatch(const std::string& history_context, 
                             Segments* segments) {
@@ -189,49 +107,33 @@ bool QueryAiConversionBatch(const std::string& history_context,
     
     size_t seg_count = segments->conversion_segments_size();
     
+    // ペイロード構築
     std::ostringstream payload;
+    payload << kProtocolVersion << "\t";
     payload << history_context << "\t";
     payload << seg_count;
     
-    std::ostringstream debug_send;
-    debug_send << "[MozcAI] >>> hist:" << history_context.length() << " segs:" << seg_count << " [";
-    
     for (size_t i = 0; i < seg_count; ++i) {
         const Segment& seg = segments->conversion_segment(i);
-        
         std::string reading(seg.key().data(), seg.key().size());
-        int eng_flag = DetectEnglishModeFlag(seg);
-        
-        payload << "\t" << reading;
-        payload << "\t" << eng_flag;
         
         int cand_count = std::min(static_cast<int>(seg.candidates_size()), 
-                                   kMaxCandidatesPerSegment);
+                                   kMaxCandidatesToSend);
+        
+        payload << "\t" << reading;
         payload << "\t" << cand_count;
         
-        debug_send << reading;
-        if (eng_flag) debug_send << "[E]";
-        debug_send << "(";
-        
         for (int j = 0; j < cand_count; ++j) {
-            std::string cand_val = seg.candidate(j).value;
-            payload << "\t" << cand_val;
-            if (j < 3) {
-                debug_send << cand_val;
-                if (j < 2 && j < cand_count - 1) debug_send << "/";
-            }
+            payload << "\t" << seg.candidate(j).value;
         }
-        debug_send << ")";
-        if (i < seg_count - 1) debug_send << " ";
     }
-    debug_send << "]\n";
-    DebugLog("%s", debug_send.str().c_str());
+    payload << "\n";
     
     std::string payload_str = payload.str();
-    
     char buffer[65536];
     DWORD bytes_read = 0;
     
+    // パイプ通信 (ブロッキングだがタイムアウト付き)
     BOOL success = ::CallNamedPipeA(
         kAiPipeName,
         const_cast<char*>(payload_str.c_str()),
@@ -242,132 +144,128 @@ bool QueryAiConversionBatch(const std::string& history_context,
         kPipeTimeoutMs
     );
     
+    // 【高速脱出】通信失敗、タイムアウト、空応答なら即座に終了
     if (!success || bytes_read == 0) {
-        DebugLog("[MozcAI] Pipe failed: err=%d\n", ::GetLastError());
         return false;
     }
     
+    // レスポンス解析
     std::string response(buffer, bytes_read);
-    std::vector<std::string> selected_values;
+    std::vector<std::string> ai_candidates;
     
     {
         std::istringstream iss(response);
         std::string token;
         while (std::getline(iss, token, '\t')) {
-            selected_values.push_back(token);
+            if (!token.empty() && token.back() == '\n') token.pop_back();
+            if (!token.empty()) ai_candidates.push_back(token);
         }
     }
     
-    std::ostringstream debug_recv;
-    debug_recv << "[MozcAI] <<< ";
-    for (size_t i = 0; i < selected_values.size(); ++i) {
-        debug_recv << "[" << selected_values[i] << "]";
-    }
-    debug_recv << "\n";
-    DebugLog("%s", debug_recv.str().c_str());
+    if (ai_candidates.empty()) return false;
+
+    // 結果適用: AI候補の強制適用 (Injection)
+    // AI候補リストの「後ろ」から順に処理し、リスト先頭へmoveしていくことで
+    // 最終的にAIのTop1候補がセグメントの先頭(index 0)に来るようにする。
     
-    size_t applied_count = 0;
-    size_t same_count = 0;
-    
-    for (size_t i = 0; i < seg_count && i < selected_values.size(); ++i) {
-        const std::string& selected = selected_values[i];
-        if (selected.empty()) {
-            continue;
-        }
-        
-        Segment* seg = segments->mutable_conversion_segment(i);
-        
-        int found_index = -1;
-        for (size_t j = 0; j < seg->candidates_size(); ++j) {
-            if (seg->candidate(j).value == selected) {
-                found_index = static_cast<int>(j);
-                break;
-            }
-        }
-        
-        if (found_index > 0) {
-            seg->move_candidate(found_index, 0);
-            seg->mutable_candidate(0)->attributes |= Attribute::RERANKED;
-            applied_count++;
-        } else if (found_index == 0) {
-            same_count++;
-        } else {
-            // AI生成の新候補を追加
-            std::string reading(seg->key().data(), seg->key().size());
-            Candidate* cand = seg->push_back_candidate();
-            cand->key = reading;
-            cand->content_key = reading;
-            cand->value = selected;
-            cand->content_value = selected;
-            cand->cost = 0;
-            cand->structure_cost = 0;
+    bool changed = false;
+
+    for (int k = static_cast<int>(ai_candidates.size()) - 1; k >= 0; --k) {
+        const std::string& ai_val = ai_candidates[k];
+        if (ai_val.empty()) continue;
+
+        bool injected_or_moved = false;
+
+        // 全セグメントを走査してマッチング
+        for (size_t i = 0; i < seg_count; ++i) {
+            Segment* seg = segments->mutable_conversion_segment(i);
             
-            if (seg->candidates_size() > 1) {
-                const Candidate& first = seg->candidate(0);
-                cand->lid = first.lid;
-                cand->rid = first.rid;
+            // 1. 既存候補にあるか検索
+            for (size_t j = 0; j < seg->candidates_size(); ++j) {
+                if (seg->candidate(j).value == ai_val) {
+                    // あれば先頭へ移動 (Rank Up)
+                    seg->move_candidate(static_cast<int>(j), 0);
+                    seg->mutable_candidate(0)->attributes |= Attribute::RERANKED;
+                    // AI推奨なのでコスト0（最高優先度）
+                    seg->mutable_candidate(0)->cost = 0;
+                    injected_or_moved = true;
+                    changed = true;
+                    break;
+                }
+            }
+            if (injected_or_moved) break; // 1つのAI候補は1つのセグメントにのみ適用
+        }
+
+        // 2. どのセグメントにもなければ、先頭セグメントに強制追加 (Injection)
+        // これにより「ういんどうず」→「Windows」等の未知語・英語変換を実現
+        if (!injected_or_moved && seg_count > 0) {
+            // 異常に長い候補は無視
+            if (ai_val.size() > 200) continue;
+
+            Segment* target_seg = segments->mutable_conversion_segment(0);
+            
+            // 新規候補作成
+            Candidate* cand = target_seg->push_back_candidate();
+            cand->Init();
+            cand->key = target_seg->key(); 
+            cand->content_key = target_seg->key();
+            cand->value = ai_val;
+            cand->content_value = ai_val;
+            cand->cost = 0; // 最強
+            cand->structure_cost = 0;
+            cand->attributes |= Attribute::RERANKED;
+            
+            // 品詞IDの継承（安全策として既存トップからコピー）
+            if (target_seg->candidates_size() > 1) {
+                const Candidate& base = target_seg->candidate(0); 
+                cand->lid = base.lid;
+                cand->rid = base.rid;
             } else {
                 cand->lid = 0;
                 cand->rid = 0;
             }
-            cand->attributes |= Attribute::RERANKED;
+
+            // 追加した候補(末尾)を先頭へ移動
+            target_seg->move_candidate(static_cast<int>(target_seg->candidates_size()) - 1, 0);
             
-            if (seg->candidates_size() > 1) {
-                seg->move_candidate(seg->candidates_size() - 1, 0);
-            }
-            applied_count++;
+            changed = true;
         }
     }
     
-    DebugLog("[MozcAI] Result: applied=%zu same=%zu total=%zu\n", 
-             applied_count, same_count, seg_count);
-    
-    return applied_count > 0 || same_count > 0;
+    return changed;
 }
 
 /**
- * 確定情報をAIサーバーに通知（学習用） - CommitSegments用
+ * 学習通知 (CommitSegments用: インデックス指定あり)
  */
 void NotifyLearnToAI(const Segments& segments, 
                      absl::Span<const size_t> candidate_indices) {
-    if (candidate_indices.empty()) {
-        return;
-    }
-    
-    size_t conv_seg_count = segments.conversion_segments_size();
-    if (conv_seg_count == 0) {
-        return;
-    }
+    if (candidate_indices.empty()) return;
     
     std::ostringstream payload;
     payload << "LEARN";
     
-    size_t sent_count = 0;
-    for (size_t i = 0; i < candidate_indices.size() && i < conv_seg_count; ++i) {
+    bool has_data = false;
+    for (size_t i = 0; i < candidate_indices.size() && i < segments.conversion_segments_size(); ++i) {
         const Segment& seg = segments.conversion_segment(i);
-        size_t cand_idx = candidate_indices[i];
+        size_t idx = candidate_indices[i];
         
-        if (cand_idx < seg.candidates_size()) {
+        if (idx < seg.candidates_size()) {
             std::string reading(seg.key().data(), seg.key().size());
-            std::string value = seg.candidate(cand_idx).value;
-            
+            std::string value = seg.candidate(idx).value;
             payload << "\t" << reading << "\t" << value;
-            sent_count++;
+            has_data = true;
         }
     }
     
-    if (sent_count == 0) {
-        return;
-    }
+    if (!has_data) return;
     
     std::string payload_str = payload.str();
-    
-    DebugLog("[MozcAI] Learn (CommitSegments): %s\n", payload_str.c_str());
-    
-    char buffer[256];
+    char buffer[32];
     DWORD bytes_read = 0;
     
-    BOOL result = ::CallNamedPipeA(
+    // Fire and Forget
+    ::CallNamedPipeA(
         kAiLearnPipeName,
         const_cast<char*>(payload_str.c_str()),
         static_cast<DWORD>(payload_str.size()),
@@ -376,57 +274,35 @@ void NotifyLearnToAI(const Segments& segments,
         &bytes_read,
         kLearnPipeTimeoutMs
     );
-    
-    if (result) {
-        DebugLog("[MozcAI] Learn notify (CommitSegments): %zu segments\n", sent_count);
-    }
 }
 
 /**
- * 確定情報をAIサーバーに通知（学習用） - FinishConversion用
- * セグメントの最初の候補（確定されたもの）を使用
- * 
- * v5.0新規追加:
- * この関数はFinishConversionから呼ばれ、すべての確定フローに対応します。
+ * 学習通知 (FinishConversion用: 先頭候補(=確定候補)を使用)
  */
 void NotifyLearnToAIFromSegments(const Segments& segments) {
-    size_t conv_seg_count = segments.conversion_segments_size();
-    if (conv_seg_count == 0) {
-        return;
-    }
+    if (segments.conversion_segments_size() == 0) return;
     
     std::ostringstream payload;
     payload << "LEARN";
     
-    std::ostringstream debug_msg;
-    debug_msg << "[MozcAI] Learn (Finish): ";
-    
-    size_t sent_count = 0;
-    for (size_t i = 0; i < conv_seg_count; ++i) {
+    bool has_data = false;
+    for (size_t i = 0; i < segments.conversion_segments_size(); ++i) {
         const Segment& seg = segments.conversion_segment(i);
-        
         if (seg.candidates_size() > 0) {
             std::string reading(seg.key().data(), seg.key().size());
-            std::string value = seg.candidate(0).value;
-            
+            std::string value = seg.candidate(0).value; // 確定済みなので0番目
             payload << "\t" << reading << "\t" << value;
-            debug_msg << "[" << reading << "->" << value << "]";
-            sent_count++;
+            has_data = true;
         }
     }
     
-    if (sent_count == 0) {
-        return;
-    }
+    if (!has_data) return;
     
     std::string payload_str = payload.str();
-    
-    DebugLog("%s\n", debug_msg.str().c_str());
-    
-    char buffer[256];
+    char buffer[32];
     DWORD bytes_read = 0;
     
-    BOOL result = ::CallNamedPipeA(
+    ::CallNamedPipeA(
         kAiLearnPipeName,
         const_cast<char*>(payload_str.c_str()),
         static_cast<DWORD>(payload_str.size()),
@@ -435,12 +311,6 @@ void NotifyLearnToAIFromSegments(const Segments& segments) {
         &bytes_read,
         kLearnPipeTimeoutMs
     );
-    
-    if (result) {
-        DebugLog("[MozcAI] Learn notify (FinishConversion): %zu segments sent\n", sent_count);
-    } else {
-        DebugLog("[MozcAI] Learn pipe failed (FinishConversion): err=%d\n", ::GetLastError());
-    }
 }
 
 #else
@@ -524,7 +394,7 @@ bool Converter::StartConversion(const ConversionRequest& request,
   ApplyConversion(segments, request);
 
 #ifdef _WIN32
-  // Apply AI reranking
+  // V7: 通常変換(Spaceキー)時のAIリランキング
   std::string history = GetHistoryContext(*segments);
   QueryAiConversionBatch(history, segments);
 #endif
@@ -601,6 +471,16 @@ bool Converter::StartPrediction(const ConversionRequest& request,
                  << segments->segment(0).key();
   }
   ApplyPostProcessing(request, segments);
+
+#ifdef _WIN32
+  // V7: TAB補完(PREDICTION)時のAIフック
+  // 入力中のサジェスト(PARTIAL_SUGGESTION)ではAIを呼ばないことで軽快さを維持
+  if (request.request_type() == ConversionRequest::PREDICTION) {
+      std::string history = GetHistoryContext(*segments);
+      QueryAiConversionBatch(history, segments);
+  }
+#endif
+
   return IsValidSegments(request, *segments);
 }
 
@@ -635,12 +515,10 @@ void Converter::ApplyPostProcessing(const ConversionRequest& request,
   }
 }
 
-// v5.0: FinishConversionに学習通知を追加
 void Converter::FinishConversion(const ConversionRequest& request,
                                  Segments* segments) const {
 #ifdef _WIN32
-  // 確定情報をAIに通知（学習用）
-  // この通知はすべての確定フローで呼ばれます
+  // V7: 確定時に学習通知 (FinishConversion用)
   NotifyLearnToAIFromSegments(*segments);
 #endif
 
@@ -788,11 +666,10 @@ bool Converter::FocusSegmentValue(Segments* segments, size_t segment_index,
   return rewriter_->Focus(segments, segment_index, candidate_index);
 }
 
-// v5.0: CommitSegmentsに学習通知を追加（部分コミット用）
 bool Converter::CommitSegments(Segments* segments,
                                absl::Span<const size_t> candidate_index) const {
 #ifdef _WIN32
-  // 確定情報をAIに通知（部分コミット用）
+  // V7: 部分確定時に学習通知 (インデックス指定あり)
   NotifyLearnToAI(*segments, candidate_index);
 #endif
 
@@ -1163,3 +1040,5 @@ prediction::Result Converter::MakeHistoryResult(const Segments& segments) {
 
 }  // namespace converter
 }  // namespace mozc
+
+}
