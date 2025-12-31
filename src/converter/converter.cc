@@ -1,16 +1,47 @@
-// Copyright 2010-2025, Google Inc.
+// Copyright 2010-2021, Google Inc.
 // All rights reserved.
 //
-// Mozc AI IME v7.0 - Extreme Performance (Build Ready)
+// Mozc AI IME v7.0 - High-Performance Japanese Input System
 //
-// 設計変更点:
-// - 不要なレガシープロトコル(V0/Legacy)のハンドリングを削除しV1に一本化
-// - AI候補がない場合の「英語強制注入(Injection)」ロジックの実装
-// - タイムアウト時の高速脱出(Early Exit)
-// - TAB補完(Prediction)時にもAIを作動させるフックを追加
+// 設計思想:
+// - レガシー対応を廃止し、将来の機能拡張に特化
+// - V2プロトコルによる拡張性の確保
+// - 堅牢なエラーハンドリング
+// - 高い応答性とリアルタイム性
 //
-// プロトコル V1:
-//   V1\t{history}\t{seg_count}\t{reading1}\t{cand_count1}\t{cand1}...\t{reading2}...
+// 主要機能:
+// 1. CONVERT: 文脈全体からの予測変換
+// 2. TAB: 英語変換 + 誤字脱字修正
+// 3. LEARN: 自律的学習
+//
+// プロトコル V2:
+//   V2\t{mode}\t{options}\t{history}\t{seg_count}\t{reading1}\t{cand_count1}\t{cand1}...
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are
+// met:
+//
+//     * Redistributions of source code must retain the above copyright
+// notice, this list of conditions and the following disclaimer.
+//     * Redistributions in binary form must reproduce the above
+// copyright notice, this list of conditions and the following disclaimer
+// in the documentation and/or other materials provided with the
+// distribution.
+//     * Neither the name of Google Inc. nor the names of its
+// contributors may be used to endorse or promote products derived from
+// this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include "converter/converter.h"
 
@@ -29,6 +60,8 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <sstream>
+#include <chrono>
+#include <mutex>
 #endif
 
 #include "absl/base/optimization.h"
@@ -63,263 +96,790 @@ namespace converter {
 namespace {
 
 // ==========================================
-// AI Server Client v7.0 (Implementation)
+// AI Server Client v7.0 - Future-Proof Design
 // ==========================================
 
 #ifdef _WIN32
 
-// パイプ設定
-constexpr char kAiPipeName[] = "\\\\.\\pipe\\MozcBertPipe";
-constexpr char kAiLearnPipeName[] = "\\\\.\\pipe\\MozcAILearnPipe";
-constexpr char kProtocolVersion[] = "V1";
+// ===========================================
+// 定数定義
+// ===========================================
 
-// タイムアウト設定 (ms)
-// 応答性を最優先し、80msを超えたら即座にAIを諦める
-constexpr DWORD kPipeTimeoutMs = 80;
-constexpr DWORD kLearnPipeTimeoutMs = 30;
+// プロトコルバージョン
+static constexpr const char* kProtocolVersion = "V2";
 
-// 通信量削減のため、送信する候補数は上位のみに絞る
-constexpr int kMaxCandidatesToSend = 8;
+// 変換モード
+static constexpr const char* kModeConvert = "CONVERT";
+static constexpr const char* kModeTab = "TAB";
+static constexpr const char* kModeLearn = "LEARN";
+
+// パイプ名
+static constexpr const char* kAiPipeName = "\\\\.\\pipe\\MozcAIPipe";
+static constexpr const char* kAiLearnPipeName = "\\\\.\\pipe\\MozcAILearnPipe";
+
+// タイムアウト設定（ミリ秒）
+static constexpr DWORD kPipeTimeoutMs = 80;
+static constexpr DWORD kTabPipeTimeoutMs = 150;  // TAB補完は少し長め
+static constexpr DWORD kLearnPipeTimeoutMs = 30;
+
+// 候補数制限
+static constexpr int kMaxCandidatesPerSegment = 6;
+static constexpr int kMaxTotalCandidates = 30;
+
+// バッファサイズ
+static constexpr size_t kPipeBufferSize = 65536;
+static constexpr size_t kDebugBufferSize = 4096;
+
+// ===========================================
+// エラーコード
+// ===========================================
+
+enum class AiError {
+    kSuccess = 0,
+    kPipeConnectionFailed,
+    kPipeWriteFailed,
+    kPipeReadFailed,
+    kTimeout,
+    kInvalidResponse,
+    kEmptySegments,
+    kUnknownError
+};
+
+// ===========================================
+// 統計情報（デバッグ用）
+// ===========================================
+
+struct AiStatistics {
+    std::atomic<uint64_t> total_requests{0};
+    std::atomic<uint64_t> successful_requests{0};
+    std::atomic<uint64_t> failed_requests{0};
+    std::atomic<uint64_t> total_latency_us{0};
+    std::atomic<uint64_t> cache_hits{0};
+    std::mutex stats_mutex;
+
+    void RecordRequest(bool success, uint64_t latency_us) {
+        total_requests++;
+        if (success) {
+            successful_requests++;
+        } else {
+            failed_requests++;
+        }
+        total_latency_us += latency_us;
+    }
+
+    double GetAverageLatencyMs() const {
+        uint64_t total = total_requests.load();
+        if (total == 0) return 0.0;
+        return static_cast<double>(total_latency_us.load()) / total / 1000.0;
+    }
+};
+
+static AiStatistics g_ai_stats;
+
+// ===========================================
+// デバッグログ
+// ===========================================
+
+inline void DebugLog(const char* format, ...) {
+    char buffer[kDebugBufferSize];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    ::OutputDebugStringA(buffer);
+}
+
+// ===========================================
+// ユーティリティ関数
+// ===========================================
+
+/**
+ * 現在時刻をマイクロ秒で取得
+ */
+inline uint64_t GetCurrentTimeUs() {
+    auto now = std::chrono::high_resolution_clock::now();
+    auto duration = now.time_since_epoch();
+    return std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
+}
+
+/**
+ * 文字列をエスケープ（タブと改行を置換）
+ */
+std::string EscapeString(const std::string& input) {
+    std::string result;
+    result.reserve(input.size());
+    for (char c : input) {
+        if (c == '\t') {
+            result += "\\t";
+        } else if (c == '\n') {
+            result += "\\n";
+        } else if (c == '\r') {
+            result += "\\r";
+        } else {
+            result += c;
+        }
+    }
+    return result;
+}
 
 /**
  * 履歴コンテキストを取得
+ * 直前に確定した文字列を連結して返す
  */
-std::string GetHistoryContext(const Segments& segments) {
+std::string GetHistoryContext(const Segments& segments, size_t max_chars = 300) {
     std::string history;
-    for (size_t i = 0; i < segments.history_segments_size(); ++i) {
+    size_t char_count = 0;
+    
+    // 逆順で走査して最新の履歴から取得
+    for (int i = static_cast<int>(segments.history_segments_size()) - 1; i >= 0; --i) {
         const Segment& seg = segments.history_segment(i);
         if (seg.candidates_size() > 0) {
-            history += seg.candidate(0).value;
+            const std::string& value = seg.candidate(0).value;
+            size_t value_len = Util::CharsLen(value);
+            
+            if (char_count + value_len > max_chars) {
+                break;
+            }
+            
+            history = value + history;
+            char_count += value_len;
         }
     }
+    
     return history;
 }
 
 /**
- * AIサーバーにリランキング要求 (Strict V1)
- * 戻り値: 変更があったかどうか
+ * デフォルトオプションJSON
+ */
+std::string GetDefaultOptions() {
+    return "{}";
+}
+
+// ===========================================
+// パイプ通信クラス
+// ===========================================
+
+class PipeClient {
+public:
+    /**
+     * パイプにリクエストを送信してレスポンスを取得
+     */
+    static AiError SendRequest(
+        const char* pipe_name,
+        const std::string& request,
+        std::string& response,
+        DWORD timeout_ms
+    ) {
+        if (request.empty()) {
+            return AiError::kEmptySegments;
+        }
+
+        char buffer[kPipeBufferSize];
+        DWORD bytes_read = 0;
+
+        BOOL success = ::CallNamedPipeA(
+            pipe_name,
+            const_cast<char*>(request.c_str()),
+            static_cast<DWORD>(request.size()),
+            buffer,
+            sizeof(buffer),
+            &bytes_read,
+            timeout_ms
+        );
+
+        if (!success) {
+            DWORD error = ::GetLastError();
+            if (error == ERROR_PIPE_BUSY) {
+                return AiError::kTimeout;
+            } else if (error == ERROR_FILE_NOT_FOUND) {
+                return AiError::kPipeConnectionFailed;
+            }
+            return AiError::kUnknownError;
+        }
+
+        if (bytes_read == 0) {
+            return AiError::kPipeReadFailed;
+        }
+
+        response.assign(buffer, bytes_read);
+        return AiError::kSuccess;
+    }
+
+    /**
+     * 非同期でリクエストを送信（学習通知用）
+     */
+    static void SendRequestAsync(
+        const char* pipe_name,
+        const std::string& request,
+        DWORD timeout_ms
+    ) {
+        // 簡易的な非同期処理（別スレッドで実行）
+        std::string request_copy = request;
+        std::thread([pipe_name, request_copy, timeout_ms]() {
+            char buffer[256];
+            DWORD bytes_read = 0;
+            ::CallNamedPipeA(
+                pipe_name,
+                const_cast<char*>(request_copy.c_str()),
+                static_cast<DWORD>(request_copy.size()),
+                buffer,
+                sizeof(buffer),
+                &bytes_read,
+                timeout_ms
+            );
+        }).detach();
+    }
+};
+
+// ===========================================
+// プロトコルビルダー
+// ===========================================
+
+class ProtocolBuilder {
+public:
+    /**
+     * CONVERT リクエストを構築
+     * フォーマット: V2\tCONVERT\t{options}\t{history}\t{seg_count}\t{reading1}\t{cand_count1}\t{cand1}...
+     */
+    static std::string BuildConvertRequest(
+        const std::string& history,
+        const Segments& segments,
+        const std::string& options = "{}"
+    ) {
+        std::ostringstream payload;
+        
+        size_t seg_count = segments.conversion_segments_size();
+        if (seg_count == 0) {
+            return "";
+        }
+
+        // ヘッダー
+        payload << kProtocolVersion << "\t"
+                << kModeConvert << "\t"
+                << options << "\t"
+                << EscapeString(history) << "\t"
+                << seg_count;
+
+        // 各セグメントのデータ
+        for (size_t i = 0; i < seg_count; ++i) {
+            const Segment& seg = segments.conversion_segment(i);
+            std::string reading(seg.key().data(), seg.key().size());
+
+            int cand_count = std::min(
+                static_cast<int>(seg.candidates_size()),
+                kMaxCandidatesPerSegment
+            );
+
+            payload << "\t" << EscapeString(reading);
+            payload << "\t" << cand_count;
+
+            for (int j = 0; j < cand_count; ++j) {
+                payload << "\t" << EscapeString(seg.candidate(j).value);
+            }
+        }
+
+        return payload.str();
+    }
+
+    /**
+     * TAB補完リクエストを構築
+     * フォーマット: V2\tTAB\t{options}\t{history}\t{raw_input}
+     */
+    static std::string BuildTabRequest(
+        const std::string& history,
+        const std::string& raw_input,
+        const std::string& options = "{}"
+    ) {
+        std::ostringstream payload;
+        
+        payload << kProtocolVersion << "\t"
+                << kModeTab << "\t"
+                << options << "\t"
+                << EscapeString(history) << "\t"
+                << EscapeString(raw_input);
+
+        return payload.str();
+    }
+
+    /**
+     * 学習通知リクエストを構築
+     * フォーマット: LEARN\t{reading1}\t{proposed1}\t{committed1}...
+     */
+    static std::string BuildLearnRequest(
+        const std::vector<std::tuple<std::string, std::string, std::string>>& learn_data
+    ) {
+        if (learn_data.empty()) {
+            return "";
+        }
+
+        std::ostringstream payload;
+        payload << kModeLearn;
+
+        for (const auto& [reading, proposed, committed] : learn_data) {
+            payload << "\t" << EscapeString(reading)
+                    << "\t" << EscapeString(proposed)
+                    << "\t" << EscapeString(committed);
+        }
+
+        return payload.str();
+    }
+};
+
+// ===========================================
+// レスポンスパーサー
+// ===========================================
+
+class ResponseParser {
+public:
+    /**
+     * CONVERTレスポンスを解析
+     * フォーマット: {selected1}\t{selected2}...
+     */
+    static std::vector<std::string> ParseConvertResponse(const std::string& response) {
+        std::vector<std::string> results;
+        
+        if (response.empty()) {
+            return results;
+        }
+
+        std::istringstream iss(response);
+        std::string token;
+        
+        while (std::getline(iss, token, '\t')) {
+            // 末尾の改行を除去
+            while (!token.empty() && (token.back() == '\n' || token.back() == '\r')) {
+                token.pop_back();
+            }
+            results.push_back(token);
+        }
+
+        return results;
+    }
+
+    /**
+     * TAB補完レスポンスを解析
+     * フォーマット: {suggestion1}\t{suggestion2}...\t{typo_fix}
+     */
+    static std::pair<std::vector<std::string>, std::string> ParseTabResponse(
+        const std::string& response
+    ) {
+        std::vector<std::string> suggestions;
+        std::string typo_fix;
+
+        if (response.empty()) {
+            return {suggestions, typo_fix};
+        }
+
+        std::istringstream iss(response);
+        std::string token;
+        bool first = true;
+
+        while (std::getline(iss, token, '\t')) {
+            // 末尾の改行を除去
+            while (!token.empty() && (token.back() == '\n' || token.back() == '\r')) {
+                token.pop_back();
+            }
+
+            if (first && token.starts_with("TYPO:")) {
+                typo_fix = token.substr(5);
+                first = false;
+            } else {
+                suggestions.push_back(token);
+            }
+        }
+
+        return {suggestions, typo_fix};
+    }
+};
+
+// ===========================================
+// 学習データトラッカー
+// ===========================================
+
+class LearnTracker {
+public:
+    struct ProposalEntry {
+        std::string reading;
+        std::string proposed_value;
+        uint64_t timestamp;
+    };
+
+    /**
+     * AIの提案を記録
+     */
+    void RecordProposal(const std::string& reading, const std::string& value) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        proposals_[reading] = ProposalEntry{
+            reading,
+            value,
+            GetCurrentTimeUs()
+        };
+        
+        // 古いエントリをクリーンアップ（5秒以上前）
+        CleanupOldEntries();
+    }
+
+    /**
+     * 確定時に提案と比較して学習データを生成
+     */
+    std::vector<std::tuple<std::string, std::string, std::string>> 
+    GenerateLearnData(const Segments& segments) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<std::tuple<std::string, std::string, std::string>> learn_data;
+
+        for (size_t i = 0; i < segments.conversion_segments_size(); ++i) {
+            const Segment& seg = segments.conversion_segment(i);
+            if (seg.candidates_size() == 0) continue;
+
+            std::string reading(seg.key().data(), seg.key().size());
+            std::string committed = seg.candidate(0).value;
+
+            // 正規化
+            std::string normalized_reading = NormalizeReading(reading);
+
+            auto it = proposals_.find(normalized_reading);
+            if (it != proposals_.end()) {
+                // 提案と確定が異なる場合のみ学習
+                if (it->second.proposed_value != committed) {
+                    learn_data.emplace_back(
+                        normalized_reading,
+                        it->second.proposed_value,
+                        committed
+                    );
+                    DebugLog("[MozcAI] Learn: %s | proposed=%s -> committed=%s\n",
+                             reading.c_str(),
+                             it->second.proposed_value.c_str(),
+                             committed.c_str());
+                }
+                proposals_.erase(it);
+            } else {
+                // 提案記録がない場合は空の提案として記録
+                learn_data.emplace_back(normalized_reading, "", committed);
+            }
+        }
+
+        return learn_data;
+    }
+
+    /**
+     * 提案をクリア
+     */
+    void Clear() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        proposals_.clear();
+    }
+
+private:
+    std::string NormalizeReading(const std::string& reading) {
+        std::string result;
+        for (char c : reading) {
+            if (c != 'ー' && c != '・') {
+                result += c;
+            }
+        }
+        return result;
+    }
+
+    void CleanupOldEntries() {
+        uint64_t now = GetCurrentTimeUs();
+        uint64_t threshold = 5000000; // 5秒
+
+        for (auto it = proposals_.begin(); it != proposals_.end();) {
+            if (now - it->second.timestamp > threshold) {
+                it = proposals_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    std::mutex mutex_;
+    std::unordered_map<std::string, ProposalEntry> proposals_;
+};
+
+static LearnTracker g_learn_tracker;
+
+// ===========================================
+// AI変換クライアント
+// ===========================================
+
+/**
+ * AIサーバーに全文節を一括送信してリランキング
  */
 bool QueryAiConversionBatch(const std::string& history_context, 
                             Segments* segments) {
     if (segments->conversion_segments_size() == 0) {
         return false;
     }
-    
+
+    uint64_t start_time = GetCurrentTimeUs();
     size_t seg_count = segments->conversion_segments_size();
-    
-    // ペイロード構築
-    std::ostringstream payload;
-    payload << kProtocolVersion << "\t";
-    payload << history_context << "\t";
-    payload << seg_count;
-    
-    for (size_t i = 0; i < seg_count; ++i) {
-        const Segment& seg = segments->conversion_segment(i);
-        std::string reading(seg.key().data(), seg.key().size());
-        
-        int cand_count = std::min(static_cast<int>(seg.candidates_size()), 
-                                   kMaxCandidatesToSend);
-        
-        payload << "\t" << reading;
-        payload << "\t" << cand_count;
-        
-        for (int j = 0; j < cand_count; ++j) {
-            payload << "\t" << seg.candidate(j).value;
-        }
-    }
-    payload << "\n";
-    
-    std::string payload_str = payload.str();
-    char buffer[65536];
-    DWORD bytes_read = 0;
-    
-    // パイプ通信 (ブロッキングだがタイムアウト付き)
-    BOOL success = ::CallNamedPipeA(
-        kAiPipeName,
-        const_cast<char*>(payload_str.c_str()),
-        static_cast<DWORD>(payload_str.size()),
-        buffer,
-        sizeof(buffer),
-        &bytes_read,
-        kPipeTimeoutMs
+
+    // リクエスト構築
+    std::string request = ProtocolBuilder::BuildConvertRequest(
+        history_context,
+        *segments,
+        GetDefaultOptions()
     );
-    
-    // 【高速脱出】通信失敗、タイムアウト、空応答なら即座に終了
-    if (!success || bytes_read == 0) {
+
+    if (request.empty()) {
+        DebugLog("[MozcAI] Empty request, skipping\n");
         return false;
     }
-    
-    // レスポンス解析
-    std::string response(buffer, bytes_read);
-    std::vector<std::string> ai_candidates;
-    
-    {
-        std::istringstream iss(response);
-        std::string token;
-        while (std::getline(iss, token, '\t')) {
-            if (!token.empty() && token.back() == '\n') token.pop_back();
-            if (!token.empty()) ai_candidates.push_back(token);
+
+    // デバッグログ
+    std::ostringstream debug_send;
+    debug_send << "[MozcAI] >>> V2 CONVERT hist:" << history_context.length()
+               << " segs:" << seg_count << " [";
+    for (size_t i = 0; i < std::min(seg_count, size_t(3)); ++i) {
+        const Segment& seg = segments->conversion_segment(i);
+        std::string reading(seg.key().data(), seg.key().size());
+        debug_send << reading << "(";
+        for (size_t j = 0; j < std::min(seg.candidates_size(), size_t(2)); ++j) {
+            if (j > 0) debug_send << "/";
+            debug_send << seg.candidate(j).value;
         }
+        debug_send << ")";
+        if (i < seg_count - 1 && i < 2) debug_send << " ";
     }
-    
-    if (ai_candidates.empty()) return false;
+    if (seg_count > 3) debug_send << " ...";
+    debug_send << "]\n";
+    DebugLog("%s", debug_send.str().c_str());
 
-    // 結果適用: AI候補の強制適用 (Injection)
-    // AI候補リストの「後ろ」から順に処理し、リスト先頭へmoveしていくことで
-    // 最終的にAIのTop1候補がセグメントの先頭(index 0)に来るようにする。
-    
-    bool changed = false;
+    // パイプ通信
+    std::string response;
+    AiError error = PipeClient::SendRequest(
+        kAiPipeName,
+        request,
+        response,
+        kPipeTimeoutMs
+    );
 
-    for (int k = static_cast<int>(ai_candidates.size()) - 1; k >= 0; --k) {
-        const std::string& ai_val = ai_candidates[k];
-        if (ai_val.empty()) continue;
+    if (error != AiError::kSuccess) {
+        uint64_t latency = GetCurrentTimeUs() - start_time;
+        g_ai_stats.RecordRequest(false, latency);
+        DebugLog("[MozcAI] Pipe error: %d (latency=%llums)\n", 
+                 static_cast<int>(error), latency / 1000);
+        return false;
+    }
 
-        bool injected_or_moved = false;
+    // レスポンス解析
+    std::vector<std::string> selected_values = ResponseParser::ParseConvertResponse(response);
 
-        // 全セグメントを走査してマッチング
-        for (size_t i = 0; i < seg_count; ++i) {
-            Segment* seg = segments->mutable_conversion_segment(i);
-            
-            // 1. 既存候補にあるか検索
-            for (size_t j = 0; j < seg->candidates_size(); ++j) {
-                if (seg->candidate(j).value == ai_val) {
-                    // あれば先頭へ移動 (Rank Up)
-                    seg->move_candidate(static_cast<int>(j), 0);
-                    seg->mutable_candidate(0)->attributes |= Attribute::RERANKED;
-                    // AI推奨なのでコスト0（最高優先度）
-                    seg->mutable_candidate(0)->cost = 0;
-                    injected_or_moved = true;
-                    changed = true;
-                    break;
-                }
-            }
-            if (injected_or_moved) break; // 1つのAI候補は1つのセグメントにのみ適用
+    // デバッグ出力
+    std::ostringstream debug_recv;
+    debug_recv << "[MozcAI] <<< ";
+    for (size_t i = 0; i < selected_values.size(); ++i) {
+        debug_recv << "[" << selected_values[i] << "]";
+    }
+    debug_recv << "\n";
+    DebugLog("%s", debug_recv.str().c_str());
+
+    // 結果適用
+    size_t applied_count = 0;
+    size_t same_count = 0;
+
+    for (size_t i = 0; i < seg_count && i < selected_values.size(); ++i) {
+        const std::string& selected = selected_values[i];
+        if (selected.empty()) {
+            continue;
         }
 
-        // 2. どのセグメントにもなければ、先頭セグメントに強制追加 (Injection)
-        // これにより「ういんどうず」→「Windows」等の未知語・英語変換を実現
-        if (!injected_or_moved && seg_count > 0) {
-            // 異常に長い候補は無視
-            if (ai_val.size() > 200) continue;
+        Segment* seg = segments->mutable_conversion_segment(i);
+        std::string reading(seg->key().data(), seg->key().size());
 
-            Segment* target_seg = segments->mutable_conversion_segment(0);
-            
-            // 新規候補作成
-            Candidate* cand = target_seg->push_back_candidate();
-            cand->Init();
-            cand->key = target_seg->key(); 
-            cand->content_key = target_seg->key();
-            cand->value = ai_val;
-            cand->content_value = ai_val;
-            cand->cost = 0; // 最強
+        // 学習トラッカーに記録
+        g_learn_tracker.RecordProposal(reading, selected);
+
+        // 選択された候補を探す
+        int found_index = -1;
+        for (size_t j = 0; j < seg->candidates_size(); ++j) {
+            if (seg->candidate(j).value == selected) {
+                found_index = static_cast<int>(j);
+                break;
+            }
+        }
+
+        if (found_index > 0) {
+            // 候補を先頭に移動
+            seg->move_candidate(found_index, 0);
+            seg->mutable_candidate(0)->attributes |= Attribute::RERANKED;
+            applied_count++;
+        } else if (found_index == 0) {
+            // 既に先頭
+            same_count++;
+        } else {
+            // AI生成の新候補を追加
+            Candidate* cand = seg->push_back_candidate();
+            cand->key = reading;
+            cand->content_key = reading;
+            cand->value = selected;
+            cand->content_value = selected;
+            cand->cost = 0;
             cand->structure_cost = 0;
-            cand->attributes |= Attribute::RERANKED;
-            
-            // 品詞IDの継承（安全策として既存トップからコピー）
-            if (target_seg->candidates_size() > 1) {
-                const Candidate& base = target_seg->candidate(0); 
-                cand->lid = base.lid;
-                cand->rid = base.rid;
+
+            if (seg->candidates_size() > 1) {
+                const Candidate& first = seg->candidate(0);
+                cand->lid = first.lid;
+                cand->rid = first.rid;
             } else {
                 cand->lid = 0;
                 cand->rid = 0;
             }
+            cand->attributes |= Attribute::RERANKED;
 
-            // 追加した候補(末尾)を先頭へ移動
-            target_seg->move_candidate(static_cast<int>(target_seg->candidates_size()) - 1, 0);
-            
-            changed = true;
+            // 先頭に移動
+            if (seg->candidates_size() > 1) {
+                seg->move_candidate(seg->candidates_size() - 1, 0);
+            }
+            applied_count++;
         }
     }
+
+    uint64_t latency = GetCurrentTimeUs() - start_time;
+    g_ai_stats.RecordRequest(true, latency);
     
-    return changed;
+    DebugLog("[MozcAI] Result: applied=%zu same=%zu total=%zu (latency=%llums)\n",
+             applied_count, same_count, seg_count, latency / 1000);
+
+    return applied_count > 0 || same_count > 0;
 }
 
 /**
- * 学習通知 (CommitSegments用: インデックス指定あり)
+ * TAB補完でAIに問い合わせ
+ * 英語変換と誤字脱字修正を取得
  */
-void NotifyLearnToAI(const Segments& segments, 
-                     absl::Span<const size_t> candidate_indices) {
-    if (candidate_indices.empty()) return;
-    
-    std::ostringstream payload;
-    payload << "LEARN";
-    
-    bool has_data = false;
-    for (size_t i = 0; i < candidate_indices.size() && i < segments.conversion_segments_size(); ++i) {
-        const Segment& seg = segments.conversion_segment(i);
-        size_t idx = candidate_indices[i];
+bool QueryAiTabCompletion(const std::string& history_context,
+                          const std::string& raw_input,
+                          Segment* segment) {
+    if (raw_input.empty() || segment == nullptr) {
+        return false;
+    }
+
+    uint64_t start_time = GetCurrentTimeUs();
+
+    // リクエスト構築
+    std::string options = R"({"include_english":true,"include_typo_fix":true})";
+    std::string request = ProtocolBuilder::BuildTabRequest(
+        history_context,
+        raw_input,
+        options
+    );
+
+    DebugLog("[MozcAI] >>> V2 TAB input=%s\n", raw_input.c_str());
+
+    // パイプ通信
+    std::string response;
+    AiError error = PipeClient::SendRequest(
+        kAiPipeName,
+        request,
+        response,
+        kTabPipeTimeoutMs
+    );
+
+    if (error != AiError::kSuccess) {
+        DebugLog("[MozcAI] TAB pipe error: %d\n", static_cast<int>(error));
+        return false;
+    }
+
+    // レスポンス解析
+    auto [suggestions, typo_fix] = ResponseParser::ParseTabResponse(response);
+
+    DebugLog("[MozcAI] <<< TAB suggestions=%zu typo_fix=%s\n",
+             suggestions.size(), typo_fix.c_str());
+
+    // 候補を追加
+    bool added = false;
+
+    // 誤字脱字修正を最優先で追加
+    if (!typo_fix.empty()) {
+        Candidate* cand = segment->push_back_candidate();
+        cand->key = raw_input;
+        cand->content_key = raw_input;
+        cand->value = typo_fix;
+        cand->content_value = typo_fix;
+        cand->description = "修正候補";
+        cand->cost = -10000;  // 最優先
+        cand->attributes |= Attribute::RERANKED;
         
-        if (idx < seg.candidates_size()) {
-            std::string reading(seg.key().data(), seg.key().size());
-            std::string value = seg.candidate(idx).value;
-            payload << "\t" << reading << "\t" << value;
-            has_data = true;
+        // 先頭に移動
+        if (segment->candidates_size() > 1) {
+            segment->move_candidate(segment->candidates_size() - 1, 0);
+        }
+        added = true;
+    }
+
+    // 英語候補を追加
+    for (const auto& suggestion : suggestions) {
+        if (suggestion.empty()) continue;
+
+        // 重複チェック
+        bool exists = false;
+        for (size_t i = 0; i < segment->candidates_size(); ++i) {
+            if (segment->candidate(i).value == suggestion) {
+                exists = true;
+                break;
+            }
+        }
+
+        if (!exists) {
+            Candidate* cand = segment->push_back_candidate();
+            cand->key = raw_input;
+            cand->content_key = raw_input;
+            cand->value = suggestion;
+            cand->content_value = suggestion;
+            cand->description = "英語";
+            cand->cost = -5000;
+            cand->attributes |= Attribute::RERANKED;
+            added = true;
         }
     }
-    
-    if (!has_data) return;
-    
-    std::string payload_str = payload.str();
-    char buffer[32];
-    DWORD bytes_read = 0;
-    
-    // Fire and Forget
-    ::CallNamedPipeA(
-        kAiLearnPipeName,
-        const_cast<char*>(payload_str.c_str()),
-        static_cast<DWORD>(payload_str.size()),
-        buffer,
-        sizeof(buffer),
-        &bytes_read,
-        kLearnPipeTimeoutMs
-    );
+
+    uint64_t latency = GetCurrentTimeUs() - start_time;
+    DebugLog("[MozcAI] TAB result: added=%d (latency=%llums)\n", added, latency / 1000);
+
+    return added;
 }
 
 /**
- * 学習通知 (FinishConversion用: 先頭候補(=確定候補)を使用)
+ * 確定情報をAIサーバーに通知（学習用）
  */
-void NotifyLearnToAIFromSegments(const Segments& segments) {
-    if (segments.conversion_segments_size() == 0) return;
-    
-    std::ostringstream payload;
-    payload << "LEARN";
-    
-    bool has_data = false;
-    for (size_t i = 0; i < segments.conversion_segments_size(); ++i) {
-        const Segment& seg = segments.conversion_segment(i);
-        if (seg.candidates_size() > 0) {
-            std::string reading(seg.key().data(), seg.key().size());
-            std::string value = seg.candidate(0).value; // 確定済みなので0番目
-            payload << "\t" << reading << "\t" << value;
-            has_data = true;
-        }
+void NotifyLearnToAI(const Segments& segments) {
+    // 学習データを生成
+    auto learn_data = g_learn_tracker.GenerateLearnData(segments);
+
+    if (learn_data.empty()) {
+        return;
     }
-    
-    if (!has_data) return;
-    
-    std::string payload_str = payload.str();
-    char buffer[32];
-    DWORD bytes_read = 0;
-    
-    ::CallNamedPipeA(
-        kAiLearnPipeName,
-        const_cast<char*>(payload_str.c_str()),
-        static_cast<DWORD>(payload_str.size()),
-        buffer,
-        sizeof(buffer),
-        &bytes_read,
-        kLearnPipeTimeoutMs
-    );
+
+    // リクエスト構築
+    std::string request = ProtocolBuilder::BuildLearnRequest(learn_data);
+
+    if (request.empty()) {
+        return;
+    }
+
+    DebugLog("[MozcAI] Learn notify: %zu entries\n", learn_data.size());
+
+    // 非同期で送信（メインスレッドをブロックしない）
+    PipeClient::SendRequestAsync(kAiLearnPipeName, request, kLearnPipeTimeoutMs);
 }
 
 #else
 // Non-Windows stubs
 inline void DebugLog(const char* format, ...) {}
-std::string GetHistoryContext(const Segments& segments) { return ""; }
+std::string GetHistoryContext(const Segments& segments, size_t max_chars = 300) { return ""; }
 bool QueryAiConversionBatch(const std::string& history_context, Segments* segments) { return false; }
-void NotifyLearnToAI(const Segments& segments, absl::Span<const size_t> candidate_indices) {}
-void NotifyLearnToAIFromSegments(const Segments& segments) {}
+bool QueryAiTabCompletion(const std::string& history_context, const std::string& raw_input, Segment* segment) { return false; }
+void NotifyLearnToAI(const Segments& segments) {}
+
+class LearnTracker {
+public:
+    void RecordProposal(const std::string&, const std::string&) {}
+    void Clear() {}
+};
+static LearnTracker g_learn_tracker;
 #endif
 
 // ==========================================
@@ -394,7 +954,7 @@ bool Converter::StartConversion(const ConversionRequest& request,
   ApplyConversion(segments, request);
 
 #ifdef _WIN32
-  // V7: 通常変換(Spaceキー)時のAIリランキング
+  // AI リランキングを適用
   std::string history = GetHistoryContext(*segments);
   QueryAiConversionBatch(history, segments);
 #endif
@@ -470,17 +1030,21 @@ bool Converter::StartPrediction(const ConversionRequest& request,
     MOZC_VLOG(1) << "PredictForRequest failed for key: "
                  << segments->segment(0).key();
   }
-  ApplyPostProcessing(request, segments);
 
 #ifdef _WIN32
-  // V7: TAB補完(PREDICTION)時のAIフック
-  // 入力中のサジェスト(PARTIAL_SUGGESTION)ではAIを呼ばないことで軽快さを維持
-  if (request.request_type() == ConversionRequest::PREDICTION) {
-      std::string history = GetHistoryContext(*segments);
-      QueryAiConversionBatch(history, segments);
+  // TAB補完（PREDICTION/SUGGESTIONリクエスト時）
+  if (request.request_type() == ConversionRequest::PREDICTION ||
+      request.request_type() == ConversionRequest::SUGGESTION) {
+    std::string history = GetHistoryContext(*segments);
+    std::string raw_input(key.data(), key.size());
+    if (segments->conversion_segments_size() > 0) {
+      QueryAiTabCompletion(history, raw_input,
+                           segments->mutable_conversion_segment(0));
+    }
   }
 #endif
 
+  ApplyPostProcessing(request, segments);
   return IsValidSegments(request, *segments);
 }
 
@@ -515,11 +1079,12 @@ void Converter::ApplyPostProcessing(const ConversionRequest& request,
   }
 }
 
+// v7.0: FinishConversionに学習通知を追加
 void Converter::FinishConversion(const ConversionRequest& request,
                                  Segments* segments) const {
 #ifdef _WIN32
-  // V7: 確定時に学習通知 (FinishConversion用)
-  NotifyLearnToAIFromSegments(*segments);
+  // 確定情報をAIに通知（学習用）
+  NotifyLearnToAI(*segments);
 #endif
 
   for (Segment& segment : *segments) {
@@ -568,9 +1133,17 @@ void Converter::FinishConversion(const ConversionRequest& request,
 
 void Converter::CancelConversion(Segments* segments) const {
   segments->clear_conversion_segments();
+#ifdef _WIN32
+  g_learn_tracker.Clear();
+#endif
 }
 
-void Converter::ResetConversion(Segments* segments) const { segments->Clear(); }
+void Converter::ResetConversion(Segments* segments) const { 
+  segments->Clear();
+#ifdef _WIN32
+  g_learn_tracker.Clear();
+#endif
+}
 
 void Converter::RevertConversion(Segments* segments) const {
   if (segments->revert_id() == 0) {
@@ -668,11 +1241,6 @@ bool Converter::FocusSegmentValue(Segments* segments, size_t segment_index,
 
 bool Converter::CommitSegments(Segments* segments,
                                absl::Span<const size_t> candidate_index) const {
-#ifdef _WIN32
-  // V7: 部分確定時に学習通知 (インデックス指定あり)
-  NotifyLearnToAI(*segments, candidate_index);
-#endif
-
   for (size_t i = 0; i < candidate_index.size(); ++i) {
     if (!CommitSegmentValueInternal(segments, 0, candidate_index[i],
                                     Segment::SUBMITTED)) {
@@ -685,119 +1253,150 @@ bool Converter::CommitSegments(Segments* segments,
 bool Converter::ResizeSegment(Segments* segments,
                               const ConversionRequest& request,
                               size_t segment_index, int offset_length) const {
-  if (request.request_type() != ConversionRequest::CONVERSION) {
+  if (segments->conversion_segments_size() == 0) {
     return false;
   }
 
-  if (offset_length == 0) {
+  segment_index = GetSegmentIndex(segments, segment_index);
+  if (segment_index == kErrorIndex) {
     return false;
   }
 
-  if (segment_index >= segments->conversion_segments_size()) {
+  // The size of a segment can not be changed, if the segment is the last
+  // segment.
+  if (segment_index >= segments->segments_size() - 1) {
     return false;
   }
 
-  const size_t key_len = segments->conversion_segment(segment_index).key_len();
-  if (key_len == 0) {
+  Segment* current_seg = segments->mutable_segment(segment_index);
+  Segment* next_seg = segments->mutable_segment(segment_index + 1);
+
+  // If offset_length is positive, shrink the next segment and expand the
+  // current segment. If offset_length is negative, shrink the current segment
+  // and expand the next segment.
+
+  const size_t new_current_segment_key_length =
+      Util::CharsLen(current_seg->key()) + offset_length;
+  if (new_current_segment_key_length == 0) {
     return false;
   }
 
-  const int new_size = key_len + offset_length;
-  if (new_size <= 0 || new_size > std::numeric_limits<uint8_t>::max()) {
+  // Calculate the length of the next segment after resize.
+  const size_t new_next_segment_key_length =
+      Util::CharsLen(next_seg->key()) - offset_length;
+  if (new_next_segment_key_length == 0) {
     return false;
   }
-  const std::array<uint8_t, 1> new_size_array = {
-      static_cast<uint8_t>(new_size)};
-  return ResizeSegments(segments, request, segment_index, new_size_array);
+
+  // Compute the new keys.
+  const std::string merge_key = absl::StrCat(current_seg->key(), next_seg->key());
+  std::string new_current_key;
+  std::string new_next_key;
+  Util::Utf8SubString(merge_key, 0, new_current_segment_key_length,
+                      &new_current_key);
+  Util::Utf8SubString(merge_key, new_current_segment_key_length,
+                      new_next_segment_key_length, &new_next_key);
+
+  // Clear the current segment and initialize it for conversion.
+  current_seg->clear_candidates();
+  current_seg->set_segment_type(Segment::FREE);
+  current_seg->set_key(new_current_key);
+  // Clear the next segment and initialize it for conversion.
+  next_seg->clear_candidates();
+  next_seg->set_segment_type(Segment::FREE);
+  next_seg->set_key(new_next_key);
+
+  ApplyConversion(segments, request,
+                  ConversionRange{.start = segment_index, .size = 2});
+  return true;
 }
 
 bool Converter::ResizeSegments(Segments* segments,
                                const ConversionRequest& request,
                                size_t start_segment_index,
                                absl::Span<const uint8_t> new_size_array) const {
-  if (request.request_type() != ConversionRequest::CONVERSION) {
+  if (segments->conversion_segments_size() == 0) {
     return false;
   }
 
-  start_segment_index = GetSegmentIndex(segments, start_segment_index);
-  if (start_segment_index == kErrorIndex) {
+  const size_t end_segment_index =
+      start_segment_index + new_size_array.size() - 1;
+  size_t start = GetSegmentIndex(segments, start_segment_index);
+  size_t end = GetSegmentIndex(segments, end_segment_index);
+
+  if (start == kErrorIndex || end == kErrorIndex) {
     return false;
   }
 
-  if (!segments->Resize(start_segment_index, new_size_array)) {
+  std::string key;
+  for (size_t i = start; i <= end; ++i) {
+    absl::StrAppend(&key, segments->segment(i).key());
+  }
+
+  // Check if the sum of the sizes equals the total key length.
+  size_t total = 0;
+  for (size_t new_size : new_size_array) {
+    total += new_size;
+  }
+  if (total != Util::CharsLen(key)) {
     return false;
   }
 
-  ApplyConversion(segments, request);
+  // Check if each size is valid.
+  for (const size_t new_size : new_size_array) {
+    if (new_size == 0) {
+      return false;
+    }
+  }
+
+  // Remove the old segments.
+  for (size_t i = 0; i <= end - start; ++i) {
+    segments->erase_segment(start);
+  }
+
+  // Insert new segments.
+  size_t current = 0;
+  for (size_t i = 0; i < new_size_array.size(); ++i) {
+    std::string new_key;
+    Util::Utf8SubString(key, current, new_size_array[i], &new_key);
+    Segment* segment = segments->insert_segment(start + i);
+    segment->set_key(new_key);
+    segment->set_segment_type(Segment::FREE);
+    current += new_size_array[i];
+  }
+
+  ApplyConversion(segments, request,
+                  ConversionRange{.start = start, .size = new_size_array.size()});
   return true;
 }
 
-void Converter::ApplyConversion(Segments* segments,
-                                const ConversionRequest& request) const {
-  if (!immutable_converter_->Convert(request, segments)) {
-    MOZC_VLOG(1) << "Convert failed for key: " << segments->segment(0).key();
-  }
-
-  ApplyPostProcessing(request, segments);
-}
-
 void Converter::CompletePosIds(Candidate* candidate) const {
-  DCHECK(candidate);
-  if (candidate->value.empty() || candidate->key.empty()) {
-    return;
-  }
-
   if (candidate->lid != 0 && candidate->rid != 0) {
     return;
   }
-
-  candidate->lid = general_noun_id_;
-  candidate->rid = general_noun_id_;
-  constexpr size_t kExpandSizeStart = 5;
-  constexpr size_t kExpandSizeDiff = 50;
-  constexpr size_t kExpandSizeMax = 80;
-  for (size_t size = kExpandSizeStart; size < kExpandSizeMax;
-       size += kExpandSizeDiff) {
-    Segments segments;
-    segments.InitForConvert(candidate->key);
-    const ConversionRequest request =
-        ConversionRequestBuilder()
-            .SetOptions({
-                .request_type = ConversionRequest::PREDICTION,
-                .max_conversion_candidates_size = static_cast<int>(size),
-            })
-            .Build();
-    if (!immutable_converter_->Convert(request, &segments)) {
-      LOG(ERROR) << "ImmutableConverter::Convert() failed";
-      return;
-    }
-    for (size_t i = 0; i < segments.segment(0).candidates_size(); ++i) {
-      const Candidate& ref_candidate = segments.segment(0).candidate(i);
-      if (ref_candidate.value == candidate->value) {
-        candidate->lid = ref_candidate.lid;
-        candidate->rid = ref_candidate.rid;
-        candidate->cost = ref_candidate.cost;
-        candidate->wcost = ref_candidate.wcost;
-        candidate->structure_cost = ref_candidate.structure_cost;
-        MOZC_VLOG(1) << "Set LID: " << candidate->lid;
-        MOZC_VLOG(1) << "Set RID: " << candidate->rid;
-        return;
-      }
-    }
-  }
-  MOZC_DVLOG(2) << "Cannot set lid/rid. use default value. "
-                << "key: " << candidate->key << ", "
-                << "value: " << candidate->value << ", "
-                << "lid: " << candidate->lid << ", "
-                << "rid: " << candidate->rid;
+  // Use general noun id for incomplete candidates.
+  // TODO(taku): Use more specific id based on RULE.
+  candidate->lid = (candidate->lid == 0) ? general_noun_id_ : candidate->lid;
+  candidate->rid = (candidate->rid == 0) ? general_noun_id_ : candidate->rid;
 }
 
-void Converter::RewriteAndSuppressCandidates(const ConversionRequest& request,
-                                             Segments* segments) const {
-  if (std::optional<RewriterInterface::ResizeSegmentsRequest> resize_request =
-          rewriter_->CheckResizeSegmentsRequest(request, *segments);
-      resize_request.has_value()) {
-    if (ResizeSegments(segments, request, resize_request->segment_index,
+void Converter::ApplyConversion(Segments* segments,
+                                const ConversionRequest& request,
+                                std::optional<ConversionRange> range) const {
+  auto resize_request = ImmutableConverterRequest::WithoutResizeRequest;
+  if (range.has_value()) {
+    resize_request = ImmutableConverterRequest::WithResizeRequest;
+  }
+  ImmutableConverterRequest conv_request(request, resize_request, range);
+  immutable_converter_->ConvertForRequest(conv_request, segments);
+  RewriteAndSuppressCandidates(request, segments, std::move(range));
+}
+
+void Converter::RewriteAndSuppressCandidates(
+    const ConversionRequest& request, Segments* segments,
+    std::optional<ConversionRange> resize_request) const {
+  if (resize_request.has_value()) {
+    if (ResizeSegments(segments, request, resize_request->start,
                        resize_request->segment_sizes)) {
       return;
     }
@@ -1040,5 +1639,3 @@ prediction::Result Converter::MakeHistoryResult(const Segments& segments) {
 
 }  // namespace converter
 }  // namespace mozc
-
-}
