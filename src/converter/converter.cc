@@ -62,6 +62,9 @@
 #include <sstream>
 #include <chrono>
 #include <mutex>
+#include <thread>
+#include <unordered_map>
+#include <atomic>
 #endif
 
 #include "absl/base/optimization.h"
@@ -416,10 +419,10 @@ public:
         std::ostringstream payload;
         payload << kModeLearn;
 
-        for (const auto& [reading, proposed, committed] : learn_data) {
-            payload << "\t" << EscapeString(reading)
-                    << "\t" << EscapeString(proposed)
-                    << "\t" << EscapeString(committed);
+        for (const auto& entry : learn_data) {
+            payload << "\t" << EscapeString(std::get<0>(entry))
+                    << "\t" << EscapeString(std::get<1>(entry))
+                    << "\t" << EscapeString(std::get<2>(entry));
         }
 
         return payload.str();
@@ -481,7 +484,7 @@ public:
                 token.pop_back();
             }
 
-            if (first && token.starts_with("TYPO:")) {
+            if (first && token.size() > 5 && token.substr(0, 5) == "TYPO:") {
                 typo_fix = token.substr(5);
                 first = false;
             } else {
@@ -571,13 +574,54 @@ public:
     }
 
 private:
+    /**
+     * 読みを正規化（長音記号などを除去）
+     * UTF-8文字列として処理
+     */
     std::string NormalizeReading(const std::string& reading) {
         std::string result;
-        for (char c : reading) {
-            if (c != 'ー' && c != '・') {
-                result += c;
+        result.reserve(reading.size());
+        
+        size_t i = 0;
+        while (i < reading.size()) {
+            unsigned char c = static_cast<unsigned char>(reading[i]);
+            
+            // UTF-8のバイト数を判定
+            size_t char_len = 1;
+            if ((c & 0x80) == 0) {
+                // ASCII (1 byte)
+                char_len = 1;
+            } else if ((c & 0xE0) == 0xC0) {
+                // 2 bytes
+                char_len = 2;
+            } else if ((c & 0xF0) == 0xE0) {
+                // 3 bytes (日本語はここ)
+                char_len = 3;
+            } else if ((c & 0xF8) == 0xF0) {
+                // 4 bytes
+                char_len = 4;
             }
+            
+            // 文字を抽出
+            if (i + char_len <= reading.size()) {
+                std::string ch = reading.substr(i, char_len);
+                
+                // 長音記号「ー」(U+30FC: E3 83 BC) と中点「・」(U+30FB: E3 83 BB) を除外
+                bool skip = false;
+                if (char_len == 3) {
+                    if (ch == "\xE3\x83\xBC" || ch == "\xE3\x83\xBB") {
+                        skip = true;
+                    }
+                }
+                
+                if (!skip) {
+                    result += ch;
+                }
+            }
+            
+            i += char_len;
         }
+        
         return result;
     }
 
@@ -1253,159 +1297,131 @@ bool Converter::CommitSegments(Segments* segments,
 bool Converter::ResizeSegment(Segments* segments,
                               const ConversionRequest& request,
                               size_t segment_index, int offset_length) const {
-  if (segments->conversion_segments_size() == 0) {
+  if (request.request_type() != ConversionRequest::CONVERSION) {
     return false;
   }
 
-  segment_index = GetSegmentIndex(segments, segment_index);
-  if (segment_index == kErrorIndex) {
+  if (offset_length == 0) {
     return false;
   }
 
-  // The size of a segment can not be changed, if the segment is the last
-  // segment.
-  if (segment_index >= segments->segments_size() - 1) {
+  if (segment_index >= segments->conversion_segments_size()) {
     return false;
   }
 
-  Segment* current_seg = segments->mutable_segment(segment_index);
-  Segment* next_seg = segments->mutable_segment(segment_index + 1);
-
-  // If offset_length is positive, shrink the next segment and expand the
-  // current segment. If offset_length is negative, shrink the current segment
-  // and expand the next segment.
-
-  const size_t new_current_segment_key_length =
-      Util::CharsLen(current_seg->key()) + offset_length;
-  if (new_current_segment_key_length == 0) {
+  const size_t key_len = segments->conversion_segment(segment_index).key_len();
+  if (key_len == 0) {
     return false;
   }
 
-  // Calculate the length of the next segment after resize.
-  const size_t new_next_segment_key_length =
-      Util::CharsLen(next_seg->key()) - offset_length;
-  if (new_next_segment_key_length == 0) {
+  const int new_size = key_len + offset_length;
+  if (new_size <= 0 || new_size > std::numeric_limits<uint8_t>::max()) {
     return false;
   }
-
-  // Compute the new keys.
-  const std::string merge_key = absl::StrCat(current_seg->key(), next_seg->key());
-  std::string new_current_key;
-  std::string new_next_key;
-  Util::Utf8SubString(merge_key, 0, new_current_segment_key_length,
-                      &new_current_key);
-  Util::Utf8SubString(merge_key, new_current_segment_key_length,
-                      new_next_segment_key_length, &new_next_key);
-
-  // Clear the current segment and initialize it for conversion.
-  current_seg->clear_candidates();
-  current_seg->set_segment_type(Segment::FREE);
-  current_seg->set_key(new_current_key);
-  // Clear the next segment and initialize it for conversion.
-  next_seg->clear_candidates();
-  next_seg->set_segment_type(Segment::FREE);
-  next_seg->set_key(new_next_key);
-
-  ApplyConversion(segments, request,
-                  ConversionRange{.start = segment_index, .size = 2});
-  return true;
+  const std::array<uint8_t, 1> new_size_array = {
+      static_cast<uint8_t>(new_size)};
+  return ResizeSegments(segments, request, segment_index, new_size_array);
 }
 
 bool Converter::ResizeSegments(Segments* segments,
                                const ConversionRequest& request,
                                size_t start_segment_index,
                                absl::Span<const uint8_t> new_size_array) const {
-  if (segments->conversion_segments_size() == 0) {
+  if (request.request_type() != ConversionRequest::CONVERSION) {
     return false;
   }
 
-  const size_t end_segment_index =
-      start_segment_index + new_size_array.size() - 1;
-  size_t start = GetSegmentIndex(segments, start_segment_index);
-  size_t end = GetSegmentIndex(segments, end_segment_index);
-
-  if (start == kErrorIndex || end == kErrorIndex) {
+  start_segment_index = GetSegmentIndex(segments, start_segment_index);
+  if (start_segment_index == kErrorIndex) {
     return false;
   }
 
-  std::string key;
-  for (size_t i = start; i <= end; ++i) {
-    absl::StrAppend(&key, segments->segment(i).key());
-  }
-
-  // Check if the sum of the sizes equals the total key length.
-  size_t total = 0;
-  for (size_t new_size : new_size_array) {
-    total += new_size;
-  }
-  if (total != Util::CharsLen(key)) {
+  if (!segments->Resize(start_segment_index, new_size_array)) {
     return false;
   }
 
-  // Check if each size is valid.
-  for (const size_t new_size : new_size_array) {
-    if (new_size == 0) {
-      return false;
-    }
-  }
-
-  // Remove the old segments.
-  for (size_t i = 0; i <= end - start; ++i) {
-    segments->erase_segment(start);
-  }
-
-  // Insert new segments.
-  size_t current = 0;
-  for (size_t i = 0; i < new_size_array.size(); ++i) {
-    std::string new_key;
-    Util::Utf8SubString(key, current, new_size_array[i], &new_key);
-    Segment* segment = segments->insert_segment(start + i);
-    segment->set_key(new_key);
-    segment->set_segment_type(Segment::FREE);
-    current += new_size_array[i];
-  }
-
-  ApplyConversion(segments, request,
-                  ConversionRange{.start = start, .size = new_size_array.size()});
+  ApplyConversion(segments, request);
   return true;
 }
 
+void Converter::ApplyConversion(Segments* segments,
+                                const ConversionRequest& request) const {
+  if (!immutable_converter_->Convert(request, segments)) {
+    MOZC_VLOG(1) << "Convert failed for key: " << segments->segment(0).key();
+  }
+
+  ApplyPostProcessing(request, segments);
+}
+
 void Converter::CompletePosIds(Candidate* candidate) const {
+  DCHECK(candidate);
+  if (candidate->value.empty() || candidate->key.empty()) {
+    return;
+  }
+
   if (candidate->lid != 0 && candidate->rid != 0) {
     return;
   }
-  // Use general noun id for incomplete candidates.
-  // TODO(taku): Use more specific id based on RULE.
-  candidate->lid = (candidate->lid == 0) ? general_noun_id_ : candidate->lid;
-  candidate->rid = (candidate->rid == 0) ? general_noun_id_ : candidate->rid;
-}
 
-void Converter::ApplyConversion(Segments* segments,
-                                const ConversionRequest& request,
-                                std::optional<ConversionRange> range) const {
-  auto resize_request = ImmutableConverterRequest::WithoutResizeRequest;
-  if (range.has_value()) {
-    resize_request = ImmutableConverterRequest::WithResizeRequest;
+  candidate->lid = general_noun_id_;
+  candidate->rid = general_noun_id_;
+  constexpr size_t kExpandSizeStart = 5;
+  constexpr size_t kExpandSizeDiff = 50;
+  constexpr size_t kExpandSizeMax = 80;
+  for (size_t size = kExpandSizeStart; size < kExpandSizeMax;
+       size += kExpandSizeDiff) {
+    Segments segments;
+    segments.InitForConvert(candidate->key);
+    const ConversionRequest request =
+        ConversionRequestBuilder()
+            .SetOptions({
+                .request_type = ConversionRequest::PREDICTION,
+                .max_conversion_candidates_size = static_cast<int>(size),
+            })
+            .Build();
+    if (!immutable_converter_->Convert(request, &segments)) {
+      LOG(ERROR) << "ImmutableConverter::Convert() failed";
+      return;
+    }
+    for (size_t i = 0; i < segments.segment(0).candidates_size(); ++i) {
+      const Candidate& ref_candidate = segments.segment(0).candidate(i);
+      if (ref_candidate.value == candidate->value) {
+        candidate->lid = ref_candidate.lid;
+        candidate->rid = ref_candidate.rid;
+        candidate->cost = ref_candidate.cost;
+        candidate->wcost = ref_candidate.wcost;
+        candidate->structure_cost = ref_candidate.structure_cost;
+        MOZC_VLOG(1) << "Set LID: " << candidate->lid;
+        MOZC_VLOG(1) << "Set RID: " << candidate->rid;
+        return;
+      }
+    }
   }
-  ImmutableConverterRequest conv_request(request, resize_request, range);
-  immutable_converter_->ConvertForRequest(conv_request, segments);
-  RewriteAndSuppressCandidates(request, segments, std::move(range));
+  MOZC_DVLOG(2) << "Cannot set lid/rid. use default value. "
+                << "key: " << candidate->key << ", "
+                << "value: " << candidate->value << ", "
+                << "lid: " << candidate->lid << ", "
+                << "rid: " << candidate->rid;
 }
 
-void Converter::RewriteAndSuppressCandidates(
-    const ConversionRequest& request, Segments* segments,
-    std::optional<ConversionRange> resize_request) const {
-  if (resize_request.has_value()) {
-    if (ResizeSegments(segments, request, resize_request->start,
+void Converter::RewriteAndSuppressCandidates(const ConversionRequest& request,
+                                             Segments* segments) const {
+  // 1. Resize segments if needed.
+  if (std::optional<RewriterInterface::ResizeSegmentsRequest> resize_request =
+          rewriter_->CheckResizeSegmentsRequest(request, *segments);
+      resize_request.has_value()) {
+    if (ResizeSegments(segments, request, resize_request->segment_index,
                        resize_request->segment_sizes)) {
       return;
     }
   }
 
+  // 2. Rewrite candidates in each segment.
   if (!rewriter_->Rewrite(request, segments)) {
     return;
   }
 
+  // 3. Suppress candidates in each segment.
   if (!user_dictionary_.HasSuppressedEntries()) {
     return;
   }
